@@ -2,15 +2,16 @@
 Rapid Rug Filter - Solana Meme Coin Structural Rug Risk Scanner
 Production-grade REST API microservice for OnDemand agent tool calling.
 
-Uses RapidAPI "Solana & Near crypto APIs" (APISOLUTION) as primary data provider.
+Uses Solana JSON-RPC directly (public mainnet endpoint or Helius).
+No RapidAPI dependency — calls Solana chain nodes directly for speed.
 """
 
 import os
 import time
 import json
-import hashlib
+import struct
+import base64
 from datetime import datetime, timezone
-from functools import wraps
 from flask import Flask, request, jsonify
 
 import requests as http_requests
@@ -20,30 +21,52 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
-RAPIDAPI_HOST = "solana-near-crypto-apis.p.rapidapi.com"
-RAPIDAPI_BASE = f"https://{RAPIDAPI_HOST}/solana"
-NETWORK = "mainnet-beta"  # production Solana network
+# Primary: free public Solana RPC. Override with SOLANA_RPC_URL env var.
+# For production, use Helius/Quicknode/Triton for higher rate limits.
+SOLANA_RPC_URL = os.environ.get(
+    "SOLANA_RPC_URL",
+    "https://api.mainnet-beta.solana.com"
+)
 
-CACHE_TTL_SECONDS = 20  # short TTL for pump scenarios
-SNAPSHOT_TTL_SECONDS = 120  # snapshot cache lives longer
+CACHE_TTL_SECONDS = 20
+SNAPSHOT_TTL_SECONDS = 120
 
-# In-memory caches (use Redis in true production)
-_account_cache = {}   # key -> (timestamp, data)
-_snapshot_cache = {}  # mint -> (timestamp, analysis_result)
+_account_cache = {}
+_snapshot_cache = {}
 
-# SPL Token Program ID
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Solana JSON-RPC Client
 # ---------------------------------------------------------------------------
-def _rapid_headers():
-    return {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": RAPIDAPI_HOST,
+def _rpc_call(method, params, timeout=10):
+    """Make a Solana JSON-RPC call."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
     }
+    try:
+        resp = http_requests.post(
+            SOLANA_RPC_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        if resp.status_code == 429:
+            return {"error": "rate_limited", "detail": "Solana RPC rate limit hit"}
+        if resp.status_code != 200:
+            return {"error": f"http_{resp.status_code}", "detail": resp.text[:500]}
+        data = resp.json()
+        if "error" in data:
+            return {"error": "rpc_error", "detail": data["error"]}
+        return data
+    except http_requests.exceptions.Timeout:
+        return {"error": "timeout", "detail": f"RPC call {method} timed out"}
+    except Exception as e:
+        return {"error": "request_failed", "detail": str(e)[:300]}
 
 
 def _cache_get(cache, key, ttl):
@@ -57,84 +80,80 @@ def _cache_set(cache, key, data):
     cache[key] = (time.time(), data)
 
 
-def _rapid_get(endpoint, params, timeout=8):
-    """Call a RapidAPI GET endpoint with rate-limit handling."""
-    url = f"{RAPIDAPI_BASE}/{endpoint}"
-    params["network"] = NETWORK
-    try:
-        resp = http_requests.get(url, headers=_rapid_headers(), params=params, timeout=timeout)
-        # Handle rate limits
-        if resp.status_code == 429:
-            return {"error": "rate_limited", "detail": "RapidAPI rate limit hit. Retry after cooldown."}
-        if resp.status_code != 200:
-            return {"error": f"http_{resp.status_code}", "detail": resp.text[:500]}
-        return resp.json()
-    except http_requests.exceptions.Timeout:
-        return {"error": "timeout", "detail": f"Request to {endpoint} timed out"}
-    except Exception as e:
-        return {"error": "request_failed", "detail": str(e)[:300]}
-
-
 # ---------------------------------------------------------------------------
-# RapidAPI Data Fetchers
+# Data Fetchers
 # ---------------------------------------------------------------------------
 def fetch_account_info(pubkey):
-    """Fetch account info for a Solana public key (mint or wallet)."""
+    """getAccountInfo with jsonParsed encoding."""
     cache_key = f"acct:{pubkey}"
     cached = _cache_get(_account_cache, cache_key, CACHE_TTL_SECONDS)
     if cached is not None:
         return cached
-    data = _rapid_get("getAccountInfo", {"pubKey": pubkey})
+    data = _rpc_call("getAccountInfo", [
+        pubkey,
+        {"encoding": "jsonParsed", "commitment": "confirmed"}
+    ])
     if "error" not in data:
         _cache_set(_account_cache, cache_key, data)
     return data
 
 
-def fetch_token_accounts_by_owner(owner):
-    """Fetch all token accounts owned by a wallet."""
-    cache_key = f"tao:{owner}"
+def fetch_token_accounts_by_owner(owner, mint=None):
+    """getTokenAccountsByOwner with optional mint filter."""
+    cache_key = f"tao:{owner}:{mint or 'all'}"
     cached = _cache_get(_account_cache, cache_key, CACHE_TTL_SECONDS)
     if cached is not None:
         return cached
-    data = _rapid_get("getTokenAccountsByOwner", {"pubKey": owner})
+
+    filter_obj = {"programId": TOKEN_PROGRAM_ID}
+    if mint:
+        filter_obj = {"mint": mint}
+
+    data = _rpc_call("getTokenAccountsByOwner", [
+        owner,
+        filter_obj,
+        {"encoding": "jsonParsed", "commitment": "confirmed"}
+    ])
     if "error" not in data:
         _cache_set(_account_cache, cache_key, data)
     return data
 
 
-def fetch_token_account_balance(token_account_pubkey):
-    """Fetch balance of a specific token account."""
-    data = _rapid_get("getTokenAccountBalance", {"pubKey": token_account_pubkey})
-    return data
-
-
-def fetch_transaction_detail(pubkey, number=10):
-    """Fetch recent transaction details for a public key."""
-    cache_key = f"txd:{pubkey}:{number}"
+def fetch_signatures_for_address(address, limit=15):
+    """getSignaturesForAddress — list recent tx signatures."""
+    cache_key = f"sigs:{address}:{limit}"
     cached = _cache_get(_account_cache, cache_key, CACHE_TTL_SECONDS)
     if cached is not None:
         return cached
-    data = _rapid_get("getTransactionDetail", {"pubKey": pubkey, "number": str(number)})
+    data = _rpc_call("getSignaturesForAddress", [
+        address,
+        {"limit": limit, "commitment": "confirmed"}
+    ])
     if "error" not in data:
         _cache_set(_account_cache, cache_key, data)
     return data
 
 
-def fetch_transaction_with_signature(signature):
-    """Fetch transaction by signature."""
-    data = _rapid_get("getTransitionWithSignature", {"pubKey": signature})
+def fetch_transaction(signature):
+    """getTransaction with jsonParsed encoding."""
+    cache_key = f"tx:{signature}"
+    cached = _cache_get(_account_cache, cache_key, 60)
+    if cached is not None:
+        return cached
+    data = _rpc_call("getTransaction", [
+        signature,
+        {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
+    ])
+    if "error" not in data:
+        _cache_set(_account_cache, cache_key, data)
     return data
 
 
 # ---------------------------------------------------------------------------
-# Parsers - Extract structured data from RapidAPI responses
+# Parsers
 # ---------------------------------------------------------------------------
 def parse_mint_info(raw):
-    """
-    Parse mint account info from getAccountInfo response.
-    Handles both jsonParsed format and raw/base64 encoded data.
-    Returns dict with: mint_authority, freeze_authority, supply, decimals, is_initialized
-    """
+    """Parse mint account from getAccountInfo jsonParsed response."""
     result = {
         "mint_authority": None,
         "mint_authority_revoked": None,
@@ -150,157 +169,75 @@ def parse_mint_info(raw):
         result["parse_error"] = raw.get("error", "empty_response") if raw else "null_response"
         return result
 
-    # Try to navigate the response structure
-    # The API may return data in various nested formats
-    value = None
-
-    # Standard Solana RPC envelope: result.value
-    if isinstance(raw, dict):
-        if "result" in raw:
-            r = raw["result"]
-            if isinstance(r, dict) and "value" in r:
-                value = r["value"]
-            else:
-                value = r
-        elif "value" in raw:
-            value = raw["value"]
-        elif "data" in raw:
-            value = raw
-        else:
-            # The whole response might be the value
-            value = raw
-
-    if not value:
-        result["parse_error"] = "could_not_find_value_in_response"
-        return result
-
-    # Try to find parsed data
-    data = value.get("data") if isinstance(value, dict) else None
-
-    if isinstance(data, dict) and "parsed" in data:
-        parsed = data["parsed"]
-        info = parsed.get("info", {})
-        ptype = parsed.get("type", "")
-
-        if ptype == "mint" or "mintAuthority" in info or "supply" in info:
-            ma = info.get("mintAuthority")
-            fa = info.get("freezeAuthority")
-            result["mint_authority"] = ma
-            result["mint_authority_revoked"] = ma is None or ma == "" or ma == "null"
-            result["freeze_authority"] = fa
-            result["freeze_authority_revoked"] = fa is None or fa == "" or fa == "null"
-            result["supply"] = info.get("supply")
-            result["decimals"] = info.get("decimals")
-            result["is_initialized"] = info.get("isInitialized", True)
+    try:
+        value = raw.get("result", {}).get("value")
+        if not value:
+            result["parse_error"] = "account_not_found_or_null"
             return result
 
-    # If data is a list (base64 encoded), try to decode SPL mint layout
-    if isinstance(data, list) and len(data) >= 1:
-        try:
-            import base64
+        data = value.get("data", {})
+
+        if isinstance(data, dict) and "parsed" in data:
+            parsed = data["parsed"]
+            info = parsed.get("info", {})
+            ptype = parsed.get("type", "")
+
+            if ptype == "mint" or "supply" in info:
+                ma = info.get("mintAuthority")
+                fa = info.get("freezeAuthority")
+                result["mint_authority"] = ma
+                result["mint_authority_revoked"] = (ma is None)
+                result["freeze_authority"] = fa
+                result["freeze_authority_revoked"] = (fa is None)
+                result["supply"] = info.get("supply")
+                result["decimals"] = info.get("decimals")
+                result["is_initialized"] = info.get("isInitialized", True)
+                return result
+
+        # Fallback: decode raw base64 bytes
+        if isinstance(data, list) and len(data) >= 1 and isinstance(data[0], str):
             raw_bytes = base64.b64decode(data[0])
             if len(raw_bytes) >= 76:
-                result = _decode_mint_bytes(raw_bytes)
-                return result
-        except Exception as e:
-            result["parse_error"] = f"base64_decode_failed: {str(e)[:100]}"
-            return result
+                return _decode_mint_bytes(raw_bytes)
 
-    # If data is a string (base64), decode
-    if isinstance(data, str):
-        try:
-            import base64
-            raw_bytes = base64.b64decode(data)
-            if len(raw_bytes) >= 76:
-                result = _decode_mint_bytes(raw_bytes)
-                return result
-        except Exception:
-            pass
+        result["parse_error"] = "not_a_mint_account"
+    except Exception as e:
+        result["parse_error"] = f"parse_exception: {str(e)[:200]}"
 
-    # Try to find the info directly in the value
-    if isinstance(value, dict):
-        for key in ["mintAuthority", "mint_authority"]:
-            if key in value:
-                ma = value.get("mintAuthority") or value.get("mint_authority")
-                fa = value.get("freezeAuthority") or value.get("freeze_authority")
-                result["mint_authority"] = ma
-                result["mint_authority_revoked"] = ma is None or ma == "" or ma == "null"
-                result["freeze_authority"] = fa
-                result["freeze_authority_revoked"] = fa is None or fa == "" or fa == "null"
-                result["supply"] = value.get("supply")
-                result["decimals"] = value.get("decimals")
-                result["is_initialized"] = value.get("isInitialized", True)
-                return result
-
-    result["parse_error"] = "unrecognized_response_format"
     return result
 
 
 def _decode_mint_bytes(raw_bytes):
-    """Decode SPL Token Mint account from raw bytes (82 bytes layout)."""
-    import struct
-
+    """Decode SPL Token Mint from raw 82-byte layout."""
     result = {
-        "mint_authority": None,
-        "mint_authority_revoked": None,
-        "freeze_authority": None,
-        "freeze_authority_revoked": None,
-        "supply": None,
-        "decimals": None,
-        "is_initialized": None,
-        "parse_error": None,
+        "mint_authority": None, "mint_authority_revoked": None,
+        "freeze_authority": None, "freeze_authority_revoked": None,
+        "supply": None, "decimals": None, "is_initialized": None, "parse_error": None,
     }
-
-    # Offset 0: COption<Pubkey> mintAuthority (1 + 32 = 33 bytes)
-    ma_option = raw_bytes[0]
-    if ma_option == 0:
-        result["mint_authority"] = None
-        result["mint_authority_revoked"] = True
-    elif ma_option == 1:
-        import base64
-        ma_bytes = raw_bytes[1:33]
-        # Convert to base58 (simplified - use hex for now, full b58 below)
-        result["mint_authority"] = _bytes_to_base58(ma_bytes)
-        result["mint_authority_revoked"] = False
-    else:
-        result["parse_error"] = f"invalid_mint_authority_option_byte: {ma_option}"
-        return result
-
-    # Offset 33: u64 supply (8 bytes LE)
-    supply_raw = struct.unpack_from("<Q", raw_bytes, 33)[0]
-    result["supply"] = str(supply_raw)
-
-    # Offset 41: u8 decimals
+    # mintAuthority: COption<Pubkey> at offset 0 (1 + 32 bytes)
+    ma_opt = raw_bytes[0]
+    result["mint_authority_revoked"] = (ma_opt == 0)
+    result["mint_authority"] = _bytes_to_base58(raw_bytes[1:33]) if ma_opt == 1 else None
+    # supply: u64 LE at offset 33
+    result["supply"] = str(struct.unpack_from("<Q", raw_bytes, 33)[0])
+    # decimals: u8 at offset 41
     result["decimals"] = raw_bytes[41]
-
-    # Offset 42: bool isInitialized
-    result["is_initialized"] = raw_bytes[42] == 1
-
-    # Offset 43: COption<Pubkey> freezeAuthority (1 + 32 = 33 bytes)
-    fa_option = raw_bytes[43]
-    if fa_option == 0:
-        result["freeze_authority"] = None
-        result["freeze_authority_revoked"] = True
-    elif fa_option == 1:
-        fa_bytes = raw_bytes[44:76]
-        result["freeze_authority"] = _bytes_to_base58(fa_bytes)
-        result["freeze_authority_revoked"] = False
-    else:
-        result["freeze_authority"] = None
-        result["freeze_authority_revoked"] = True
-
+    # isInitialized: bool at offset 42
+    result["is_initialized"] = (raw_bytes[42] == 1)
+    # freezeAuthority: COption<Pubkey> at offset 43
+    fa_opt = raw_bytes[43]
+    result["freeze_authority_revoked"] = (fa_opt == 0)
+    result["freeze_authority"] = _bytes_to_base58(raw_bytes[44:76]) if fa_opt == 1 else None
     return result
 
 
 def _bytes_to_base58(data):
-    """Convert bytes to base58 string (Bitcoin/Solana alphabet)."""
     ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
     n = int.from_bytes(data, "big")
     result = bytearray()
     while n > 0:
         n, remainder = divmod(n, 58)
         result.append(ALPHABET[remainder])
-    # Count leading zeros
     for byte in data:
         if byte == 0:
             result.append(ALPHABET[0])
@@ -310,160 +247,116 @@ def _bytes_to_base58(data):
 
 
 def parse_token_accounts_for_mint(raw, target_mint):
-    """
-    Parse getTokenAccountsByOwner response and filter for a specific mint.
-    Returns list of {pubkey, mint, amount, decimals, ui_amount}.
-    """
+    """Parse getTokenAccountsByOwner response, filter by mint."""
     accounts = []
     if not raw or "error" in raw:
         return accounts
-
-    # Navigate response
-    value_list = None
-    if isinstance(raw, dict):
-        if "result" in raw:
-            r = raw["result"]
-            if isinstance(r, dict) and "value" in r:
-                value_list = r["value"]
-            elif isinstance(r, list):
-                value_list = r
-        elif "value" in raw:
-            value_list = raw["value"]
-        elif isinstance(raw, list):
-            value_list = raw
-
-    if not value_list or not isinstance(value_list, list):
-        return accounts
-
-    for item in value_list:
-        try:
-            pubkey = item.get("pubkey", "")
+    try:
+        value_list = raw.get("result", {}).get("value", [])
+        for item in value_list:
             acct = item.get("account", {})
             data = acct.get("data", {})
-
             if isinstance(data, dict) and "parsed" in data:
                 info = data["parsed"].get("info", {})
                 mint = info.get("mint", "")
-                token_amount = info.get("tokenAmount", {})
-
-                if mint.lower() == target_mint.lower() or not target_mint:
+                ta = info.get("tokenAmount", {})
+                if mint == target_mint:
                     accounts.append({
-                        "pubkey": pubkey,
+                        "pubkey": item.get("pubkey", ""),
                         "mint": mint,
-                        "amount": token_amount.get("amount", "0"),
-                        "decimals": token_amount.get("decimals", 0),
-                        "ui_amount": token_amount.get("uiAmount", 0),
+                        "amount": ta.get("amount", "0"),
+                        "decimals": ta.get("decimals", 0),
+                        "ui_amount": ta.get("uiAmount", 0),
                     })
-        except Exception:
-            continue
-
+    except Exception:
+        pass
     return accounts
 
 
-def parse_transactions_for_signals(raw, dev_wallet=None, target_mint=None):
+def analyze_transactions(dev_wallet, target_mint, signatures_raw=None, provided_sigs=None):
     """
-    Parse transaction details looking for suspicious patterns.
-    Returns dict of signals.
+    Fetch and analyze recent transactions for dev wallet.
+    Returns tx signal dict.
     """
     signals = {
         "large_outbound_count": 0,
         "fanout_flag": False,
         "total_tx_analyzed": 0,
-        "unique_destinations": set(),
+        "unique_destination_count": 0,
         "notes": [],
     }
 
-    if not raw or "error" in raw:
-        signals["notes"].append("Could not fetch transaction data")
+    # Get signatures
+    sig_list = []
+    if provided_sigs:
+        sig_list = provided_sigs[:10]
+    elif dev_wallet:
+        sigs_raw = fetch_signatures_for_address(dev_wallet, limit=15)
+        if sigs_raw and "result" in sigs_raw:
+            for s in sigs_raw["result"]:
+                if isinstance(s, dict) and "signature" in s:
+                    sig_list.append(s["signature"])
+
+    if not sig_list:
+        signals["notes"].append("No transaction signatures found")
         return signals
 
-    # Try to get transaction list
-    tx_list = None
-    if isinstance(raw, dict):
-        if "result" in raw:
-            r = raw["result"]
-            if isinstance(r, list):
-                tx_list = r
-            elif isinstance(r, dict):
-                tx_list = [r]
-        elif isinstance(raw, list):
-            tx_list = raw
-    elif isinstance(raw, list):
-        tx_list = raw
+    unique_dests = set()
 
-    if not tx_list:
-        signals["notes"].append("No transactions found in response")
-        return signals
-
-    for tx in tx_list:
-        if not isinstance(tx, dict):
+    # Analyze up to 8 transactions to stay within rate limits
+    for sig in sig_list[:8]:
+        tx_raw = fetch_transaction(sig)
+        if not tx_raw or "error" in tx_raw:
             continue
+
+        tx_result = tx_raw.get("result")
+        if not tx_result:
+            continue
+
         signals["total_tx_analyzed"] += 1
+        meta = tx_result.get("meta", {})
+        if not meta:
+            continue
 
-        # Try to extract instructions
-        transaction = tx.get("transaction", tx)
-        message = transaction.get("message", {}) if isinstance(transaction, dict) else {}
-        instructions = message.get("instructions", []) if isinstance(message, dict) else []
+        pre_token = meta.get("preTokenBalances") or []
+        post_token = meta.get("postTokenBalances") or []
 
-        # Also check meta for token transfers
-        meta = tx.get("meta", {})
-        if isinstance(meta, dict):
-            pre_token = meta.get("preTokenBalances", [])
-            post_token = meta.get("postTokenBalances", [])
+        # Build balance delta map: accountIndex -> (owner, mint, pre_amount, post_amount)
+        pre_map = {}
+        for b in pre_token:
+            if isinstance(b, dict) and b.get("mint") == target_mint:
+                idx = b.get("accountIndex")
+                owner = b.get("owner", "")
+                amt = float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                pre_map[idx] = (owner, amt)
 
-            # Look for outbound token transfers from dev wallet
-            for pre in (pre_token or []):
-                if isinstance(pre, dict):
-                    owner = pre.get("owner", "")
-                    mint = pre.get("mint", "")
-                    pre_amt = float(pre.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+        for b in post_token:
+            if isinstance(b, dict) and b.get("mint") == target_mint:
+                idx = b.get("accountIndex")
+                owner = b.get("owner", "")
+                post_amt = float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
 
-                    # Find corresponding post balance
-                    for post in (post_token or []):
-                        if isinstance(post, dict) and post.get("accountIndex") == pre.get("accountIndex"):
-                            post_amt = float(post.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
-                            if dev_wallet and owner == dev_wallet and pre_amt > post_amt:
-                                delta = pre_amt - post_amt
-                                if delta > 0:
-                                    signals["large_outbound_count"] += 1
-                                    signals["notes"].append(
-                                        f"Outbound transfer of {delta:.2f} tokens from dev wallet"
-                                    )
+                pre_owner, pre_amt = pre_map.get(idx, (owner, 0))
 
-            # Track unique destination wallets
-            for post in (post_token or []):
-                if isinstance(post, dict):
-                    dest_owner = post.get("owner", "")
-                    if dest_owner and dest_owner != dev_wallet:
-                        signals["unique_destinations"].add(dest_owner)
-
-        # Parse instructions for transfer patterns
-        for ix in instructions:
-            if not isinstance(ix, dict):
-                continue
-            parsed = ix.get("parsed", {})
-            if isinstance(parsed, dict):
-                ix_type = parsed.get("type", "")
-                info = parsed.get("info", {})
-                if ix_type in ("transfer", "transferChecked"):
-                    source = info.get("source", "") or info.get("authority", "")
-                    dest = info.get("destination", "")
-                    if dest:
-                        signals["unique_destinations"].add(dest)
-                    if dev_wallet and source == dev_wallet:
+                # Outbound from dev wallet
+                if dev_wallet and pre_owner == dev_wallet and pre_amt > post_amt:
+                    delta = pre_amt - post_amt
+                    if delta > 0:
                         signals["large_outbound_count"] += 1
+                        signals["notes"].append(
+                            f"Outbound: {delta:,.2f} tokens from dev in tx {sig[:12]}..."
+                        )
 
-    # Fanout detection: many unique destinations from same source
-    unique_count = len(signals["unique_destinations"])
-    if unique_count >= 5:
+                # Track destinations
+                if owner and owner != dev_wallet:
+                    unique_dests.add(owner)
+
+    signals["unique_destination_count"] = len(unique_dests)
+    if len(unique_dests) >= 5:
         signals["fanout_flag"] = True
         signals["notes"].append(
-            f"Fan-out pattern detected: {unique_count} unique destination wallets"
+            f"Fan-out: {len(unique_dests)} unique destination wallets detected"
         )
-
-    # Convert set to count for JSON serialization
-    signals["unique_destination_count"] = unique_count
-    del signals["unique_destinations"]
 
     return signals
 
@@ -472,25 +365,12 @@ def parse_transactions_for_signals(raw, dev_wallet=None, target_mint=None):
 # Core Analysis Engine
 # ---------------------------------------------------------------------------
 def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
-    """
-    Main analysis function. Returns complete risk assessment.
-
-    Steps:
-    1. Fetch mint account info -> authority checks + supply/decimals
-    2. If dev_wallet: fetch token accounts -> dev holdings
-    3. If dev_wallet or recent_signatures: fetch tx data -> tx signals
-    4. Compare against snapshot (if exists) for supply changes
-    5. Compute deterministic risk score
-    6. Return structured result
-    """
-    options = options or {}
+    """Main analysis: returns complete risk assessment."""
     timestamp = datetime.now(timezone.utc).isoformat()
     triggered_signals = []
     risk_score = 0
 
-    # -----------------------------------------------------------------------
-    # Step 1: Mint Account Info (Authority + Supply)
-    # -----------------------------------------------------------------------
+    # -- Step 1: Mint Account Info --
     raw_account = fetch_account_info(mint)
     mint_info = parse_mint_info(raw_account)
 
@@ -501,64 +381,50 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
     parse_error = mint_info.get("parse_error")
 
     if parse_error:
-        triggered_signals.append(f"WARN: Could not parse mint data: {parse_error}")
+        triggered_signals.append(f"WARN: Mint parse issue: {parse_error}")
 
-    # Authority Risk (max 30 points)
+    # Authority Risk (max 30)
     if mint_authority_revoked is False:
         risk_score += 20
-        triggered_signals.append("CRITICAL: Mint authority is ACTIVE (infinite mint risk, +20)")
+        triggered_signals.append("CRITICAL: Mint authority ACTIVE — infinite mint risk (+20)")
     elif mint_authority_revoked is True:
-        triggered_signals.append("OK: Mint authority is revoked")
+        triggered_signals.append("OK: Mint authority revoked")
 
     if freeze_authority_revoked is False:
         risk_score += 10
-        triggered_signals.append("HIGH: Freeze authority is ACTIVE (honeypot/freeze risk, +10)")
+        triggered_signals.append("HIGH: Freeze authority ACTIVE — honeypot risk (+10)")
     elif freeze_authority_revoked is True:
-        triggered_signals.append("OK: Freeze authority is revoked")
+        triggered_signals.append("OK: Freeze authority revoked")
 
-    # -----------------------------------------------------------------------
-    # Step 2: Supply Change Detection (max 20 points)
-    # -----------------------------------------------------------------------
+    # -- Step 2: Supply Change (max 20) --
     supply_change_flag = False
     prev_snapshot = _snapshot_cache.get(mint)
-
     if prev_snapshot and supply:
         prev_supply = prev_snapshot[1].get("supply")
         if prev_supply and str(supply) != str(prev_supply):
             try:
-                curr = int(supply)
-                prev = int(prev_supply)
+                curr, prev = int(supply), int(prev_supply)
                 if curr > prev:
                     supply_change_flag = True
                     risk_score += 20
                     pct = ((curr - prev) / prev * 100) if prev > 0 else 999
                     triggered_signals.append(
-                        f"CRITICAL: Supply INCREASED since last scan "
-                        f"({prev} -> {curr}, +{pct:.1f}%, +20)"
+                        f"CRITICAL: Supply INCREASED ({prev} -> {curr}, +{pct:.1f}%, +20)"
                     )
                     if mint_authority_revoked is False:
                         triggered_signals.append(
-                            "EXTREME: Supply increased AND mint authority active — likely active minting"
+                            "EXTREME: Supply up AND mint authority active"
                         )
             except (ValueError, TypeError):
                 pass
 
-    # -----------------------------------------------------------------------
-    # Step 3: Dev Wallet Holdings (max 20 points, only if dev_wallet provided)
-    # -----------------------------------------------------------------------
+    # -- Step 3: Dev Holdings (max 20) --
     dev_holdings = None
     if dev_wallet:
-        raw_token_accts = fetch_token_accounts_by_owner(dev_wallet)
-        token_accounts = parse_token_accounts_for_mint(raw_token_accts, mint)
+        raw_ta = fetch_token_accounts_by_owner(dev_wallet, mint=mint)
+        token_accounts = parse_token_accounts_for_mint(raw_ta, mint)
 
-        total_dev_tokens = 0
-        for ta in token_accounts:
-            try:
-                total_dev_tokens += int(ta.get("amount", "0"))
-            except (ValueError, TypeError):
-                pass
-
-        # Calculate percentage of supply
+        total_dev_tokens = sum(int(ta.get("amount", "0")) for ta in token_accounts)
         pct_supply = None
         if supply and int(supply) > 0:
             pct_supply = (total_dev_tokens / int(supply)) * 100
@@ -569,114 +435,58 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
             "percent_supply": round(pct_supply, 2) if pct_supply is not None else None,
         }
 
-        # Dev Exposure Risk scoring
         if pct_supply is not None:
             if pct_supply > 15:
                 risk_score += 20
-                triggered_signals.append(
-                    f"HIGH: Dev holds {pct_supply:.1f}% of supply (>15%, +20)"
-                )
+                triggered_signals.append(f"HIGH: Dev holds {pct_supply:.1f}% of supply (>15%, +20)")
             elif pct_supply > 5:
                 risk_score += 10
-                triggered_signals.append(
-                    f"MODERATE: Dev holds {pct_supply:.1f}% of supply (5-15%, +10)"
-                )
+                triggered_signals.append(f"MODERATE: Dev holds {pct_supply:.1f}% of supply (5-15%, +10)")
             else:
-                triggered_signals.append(
-                    f"OK: Dev holds {pct_supply:.1f}% of supply (<5%)"
-                )
-        elif len(token_accounts) == 0:
+                triggered_signals.append(f"OK: Dev holds {pct_supply:.1f}% of supply (<5%)")
+        elif not token_accounts:
             triggered_signals.append("INFO: Dev wallet has no token accounts for this mint")
     else:
-        triggered_signals.append("INFO: No dev_wallet provided — dev exposure check skipped")
+        triggered_signals.append("INFO: No dev_wallet — dev exposure skipped")
 
-    # -----------------------------------------------------------------------
-    # Step 4: Transaction Risk Signals (max 30 points)
-    # -----------------------------------------------------------------------
+    # -- Step 4: Transaction Signals (max 30) --
     tx_signals = {
-        "large_outbound_count": 0,
-        "fanout_flag": False,
-        "total_tx_analyzed": 0,
-        "unique_destination_count": 0,
-        "notes": [],
+        "large_outbound_count": 0, "fanout_flag": False,
+        "total_tx_analyzed": 0, "unique_destination_count": 0, "notes": [],
     }
 
-    if dev_wallet:
-        raw_tx = fetch_transaction_detail(dev_wallet, number=15)
-        tx_signals = parse_transactions_for_signals(raw_tx, dev_wallet, mint)
+    if dev_wallet or recent_signatures:
+        tx_signals = analyze_transactions(dev_wallet, mint, provided_sigs=recent_signatures)
 
-        # Transaction Risk scoring
         if tx_signals["large_outbound_count"] > 0:
             risk_score += 15
             triggered_signals.append(
-                f"HIGH: {tx_signals['large_outbound_count']} large outbound token transfers "
-                f"from dev wallet (+15)"
+                f"HIGH: {tx_signals['large_outbound_count']} outbound transfers from dev (+15)"
             )
-
         if tx_signals["fanout_flag"]:
             risk_score += 15
             triggered_signals.append(
-                f"HIGH: Fan-out dispersal pattern detected — "
-                f"{tx_signals['unique_destination_count']} unique destinations (+15)"
+                f"HIGH: Fan-out to {tx_signals['unique_destination_count']} wallets (+15)"
             )
-    elif recent_signatures:
-        # Inspect provided signatures
-        all_tx_data = []
-        for sig in recent_signatures[:5]:  # limit to 5 to stay within rate limits
-            tx_data = fetch_transaction_with_signature(sig)
-            if tx_data and "error" not in tx_data:
-                all_tx_data.append(tx_data)
-
-        if all_tx_data:
-            # Combine into a format parse_transactions_for_signals can handle
-            combined = {"result": all_tx_data}
-            tx_signals = parse_transactions_for_signals(combined, dev_wallet, mint)
-
-            if tx_signals["large_outbound_count"] > 0:
-                risk_score += 15
-                triggered_signals.append(
-                    f"HIGH: {tx_signals['large_outbound_count']} suspicious transfers "
-                    f"detected in provided signatures (+15)"
-                )
-            if tx_signals["fanout_flag"]:
-                risk_score += 15
-                triggered_signals.append(
-                    f"HIGH: Fan-out dispersal in provided signatures — "
-                    f"{tx_signals['unique_destination_count']} unique destinations (+15)"
-                )
     else:
-        triggered_signals.append(
-            "INFO: No dev_wallet or recent_signatures — transaction analysis skipped"
-        )
+        triggered_signals.append("INFO: No dev_wallet/signatures — tx analysis skipped")
 
-    # -----------------------------------------------------------------------
-    # Step 5: Compute Final Decision
-    # -----------------------------------------------------------------------
-    risk_score = min(risk_score, 100)  # cap at 100
+    # -- Step 5: Decision --
+    risk_score = min(risk_score, 100)
 
     if risk_score <= 25:
-        decision = "BUY"
-        risk_level = "LOW"
+        decision, risk_level = "BUY", "LOW"
     elif risk_score <= 50:
-        decision = "CAUTION"
-        risk_level = "MODERATE"
+        decision, risk_level = "CAUTION", "MODERATE"
     elif risk_score <= 75:
-        decision = "NO_BUY"
-        risk_level = "HIGH"
+        decision, risk_level = "NO_BUY", "HIGH"
     else:
-        decision = "NO_BUY"
-        risk_level = "EXTREME"
+        decision, risk_level = "NO_BUY", "EXTREME"
 
-    # Force NO_BUY if supply increased with active mint authority
     if supply_change_flag and mint_authority_revoked is False:
-        decision = "NO_BUY"
-        risk_level = "EXTREME"
-        if risk_score < 51:
-            risk_score = max(risk_score, 80)
+        decision, risk_level = "NO_BUY", "EXTREME"
+        risk_score = max(risk_score, 80)
 
-    # -----------------------------------------------------------------------
-    # Build Result
-    # -----------------------------------------------------------------------
     result = {
         "mint": mint,
         "mint_authority_revoked": mint_authority_revoked,
@@ -684,13 +494,7 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "supply": supply,
         "decimals": decimals,
         "dev_holdings": dev_holdings,
-        "tx_signals": {
-            "large_outbound_count": tx_signals.get("large_outbound_count", 0),
-            "fanout_flag": tx_signals.get("fanout_flag", False),
-            "total_tx_analyzed": tx_signals.get("total_tx_analyzed", 0),
-            "unique_destination_count": tx_signals.get("unique_destination_count", 0),
-            "notes": tx_signals.get("notes", []),
-        },
+        "tx_signals": tx_signals,
         "supply_change_flag": supply_change_flag,
         "risk_score": risk_score,
         "risk_level": risk_level,
@@ -699,16 +503,14 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "timestamp": timestamp,
     }
 
-    # Save snapshot
-    snapshot_data = {
+    _cache_set(_snapshot_cache, mint, {
         "supply": supply,
         "mint_authority_revoked": mint_authority_revoked,
         "freeze_authority_revoked": freeze_authority_revoked,
         "risk_score": risk_score,
         "decision": decision,
         "timestamp": timestamp,
-    }
-    _cache_set(_snapshot_cache, mint, snapshot_data)
+    })
 
     return result
 
@@ -721,35 +523,21 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "1.0.0",
-        "rapidapi_configured": bool(RAPIDAPI_KEY),
-        "network": NETWORK,
+        "version": "1.1.0",
+        "rpc_endpoint": SOLANA_RPC_URL[:50] + "...",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
 
 @app.route("/analyze", methods=["POST"])
 def analyze_endpoint():
-    """
-    Main analysis endpoint.
-    Input JSON:
-      - mint (string, required): Solana token mint address
-      - dev_wallet (string, optional): suspected dev wallet address
-      - recent_signatures (array of strings, optional): tx signatures to inspect
-      - options (object, optional): {snapshot: bool, threshold_overrides: object}
-    """
-    if not RAPIDAPI_KEY:
-        return jsonify({"error": "RAPIDAPI_KEY not configured on server"}), 500
-
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({"error": "Request body must be valid JSON"}), 400
 
     mint = data.get("mint")
     if not mint or not isinstance(mint, str) or len(mint) < 32:
-        return jsonify({
-            "error": "Missing or invalid 'mint' field. Must be a valid Solana mint address (32+ chars)."
-        }), 400
+        return jsonify({"error": "Missing or invalid 'mint'. Must be a Solana mint address."}), 400
 
     dev_wallet = data.get("dev_wallet")
     recent_signatures = data.get("recent_signatures", [])
@@ -769,10 +557,6 @@ def analyze_endpoint():
 
 @app.route("/snapshot", methods=["GET"])
 def snapshot_endpoint():
-    """
-    Return the last computed snapshot for a mint address.
-    Query param: mint (required)
-    """
     mint = request.args.get("mint")
     if not mint:
         return jsonify({"error": "Missing 'mint' query parameter"}), 400
@@ -785,12 +569,7 @@ def snapshot_endpoint():
             "cached_at": datetime.fromtimestamp(cached[0], tz=timezone.utc).isoformat(),
             "age_seconds": round(time.time() - cached[0], 1),
         })
-    else:
-        return jsonify({
-            "mint": mint,
-            "snapshot": None,
-            "message": "No snapshot available. Run /analyze first.",
-        }), 404
+    return jsonify({"mint": mint, "snapshot": None, "message": "No snapshot. Run /analyze first."}), 404
 
 
 @app.route("/", methods=["GET"])
@@ -798,19 +577,15 @@ def root():
     return jsonify({
         "service": "Rapid Rug Filter",
         "description": "Solana meme coin structural rug risk scanner",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "endpoints": {
-            "GET /health": "Service health check",
-            "POST /analyze": "Analyze a token mint for rug risk",
-            "GET /snapshot?mint=...": "Get cached analysis snapshot",
+            "GET /health": "Health check",
+            "POST /analyze": "Analyze token mint for rug risk",
+            "GET /snapshot?mint=...": "Get cached snapshot",
         },
-        "docs": "POST /analyze with JSON body: {mint: string, dev_wallet?: string, recent_signatures?: string[]}",
     })
 
 
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8787))
     app.run(host="0.0.0.0", port=port, debug=False)

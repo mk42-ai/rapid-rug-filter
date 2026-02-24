@@ -2,7 +2,8 @@
 Rapid Rug Filter - Solana Meme Coin Structural Rug Risk Scanner
 Production-grade REST API microservice for OnDemand agent tool calling.
 
-v1.2.0 — Auto dev wallet detection from mint address.
+v2.0.0 — Robust scoring overhaul: holder concentration analysis,
+token age detection, dev-dump penalty, stricter thresholds.
 Uses Solana JSON-RPC directly (public mainnet endpoint or Helius).
 No RapidAPI dependency — calls Solana chain nodes directly for speed.
 """
@@ -52,34 +53,45 @@ SYSTEM_ADDRESSES = {
 # ---------------------------------------------------------------------------
 # Solana JSON-RPC Client
 # ---------------------------------------------------------------------------
-def _rpc_call(method, params, timeout=12):
-    """Make a Solana JSON-RPC call."""
+def _rpc_call(method, params, timeout=12, retries=2):
+    """Make a Solana JSON-RPC call with retry on rate limit."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
         "params": params,
     }
-    try:
-        resp = http_requests.post(
-            SOLANA_RPC_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=timeout,
-        )
-        if resp.status_code == 429:
-            time.sleep(0.5)  # Brief backoff on rate limit
-            return {"error": "rate_limited", "detail": "Solana RPC rate limit hit"}
-        if resp.status_code != 200:
-            return {"error": f"http_{resp.status_code}", "detail": resp.text[:500]}
-        data = resp.json()
-        if "error" in data:
-            return {"error": "rpc_error", "detail": data["error"]}
-        return data
-    except http_requests.exceptions.Timeout:
-        return {"error": "timeout", "detail": f"RPC call {method} timed out"}
-    except Exception as e:
-        return {"error": "request_failed", "detail": str(e)[:300]}
+    for attempt in range(retries + 1):
+        try:
+            resp = http_requests.post(
+                SOLANA_RPC_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            if resp.status_code == 429:
+                if attempt < retries:
+                    time.sleep(0.8 * (attempt + 1))  # Exponential backoff
+                    continue
+                return {"error": "rate_limited", "detail": "Solana RPC rate limit hit"}
+            if resp.status_code != 200:
+                return {"error": f"http_{resp.status_code}", "detail": resp.text[:500]}
+            data = resp.json()
+            if "error" in data:
+                err = data["error"]
+                # Retry on server errors
+                if isinstance(err, dict) and err.get("code", 0) in (-32005, -32009):
+                    if attempt < retries:
+                        time.sleep(0.5)
+                        continue
+                return {"error": "rpc_error", "detail": err}
+            return data
+        except http_requests.exceptions.Timeout:
+            if attempt < retries:
+                continue
+            return {"error": "timeout", "detail": f"RPC call {method} timed out"}
+        except Exception as e:
+            return {"error": "request_failed", "detail": str(e)[:300]}
 
 
 def _cache_get(cache, key, ttl):
@@ -161,6 +173,140 @@ def fetch_transaction(signature):
     return data
 
 
+def fetch_token_largest_accounts(mint_pubkey):
+    """getTokenLargestAccounts — returns top 20 holders for a mint."""
+    cache_key = f"largest:{mint_pubkey}"
+    cached = _cache_get(_account_cache, cache_key, CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    data = _rpc_call("getTokenLargestAccounts", [
+        mint_pubkey,
+        {"commitment": "confirmed"}
+    ])
+    if "error" not in data:
+        _cache_set(_account_cache, cache_key, data)
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Holder Concentration Analysis (NEW in v2.0)
+# ---------------------------------------------------------------------------
+def analyze_holder_concentration(mint, supply_str):
+    """
+    Analyze top holder concentration using getTokenLargestAccounts.
+    Returns concentration metrics and risk signals.
+    """
+    result = {
+        "top1_pct": None,
+        "top5_pct": None,
+        "top10_pct": None,
+        "top20_pct": None,
+        "num_holders_above_1pct": 0,
+        "largest_holder_address": None,
+        "largest_holder_amount": None,
+        "concentration_score": 0,
+        "signals": [],
+        "error": None,
+    }
+
+    if not supply_str:
+        result["error"] = "no_supply_data"
+        return result
+
+    try:
+        total_supply = int(supply_str)
+    except (ValueError, TypeError):
+        result["error"] = "invalid_supply"
+        return result
+
+    if total_supply <= 0:
+        result["error"] = "zero_supply"
+        return result
+
+    raw = fetch_token_largest_accounts(mint)
+    if not raw or "error" in raw:
+        result["error"] = raw.get("error", "fetch_failed") if raw else "null_response"
+        return result
+
+    holders = raw.get("result", {}).get("value", [])
+    if not holders:
+        result["error"] = "no_holders"
+        return result
+
+    # Parse holder amounts
+    holder_pcts = []
+    for h in holders:
+        try:
+            amount = int(h.get("amount", "0"))
+            pct = (amount / total_supply) * 100
+            holder_pcts.append({
+                "address": h.get("address", ""),
+                "amount": amount,
+                "pct": round(pct, 2),
+            })
+        except (ValueError, TypeError):
+            continue
+
+    # Sort by amount descending
+    holder_pcts.sort(key=lambda x: x["amount"], reverse=True)
+
+    if holder_pcts:
+        result["largest_holder_address"] = holder_pcts[0]["address"]
+        result["largest_holder_amount"] = str(holder_pcts[0]["amount"])
+
+    # Calculate concentration metrics
+    top1 = holder_pcts[0]["pct"] if len(holder_pcts) >= 1 else 0
+    top5 = sum(h["pct"] for h in holder_pcts[:5])
+    top10 = sum(h["pct"] for h in holder_pcts[:10])
+    top20 = sum(h["pct"] for h in holder_pcts[:20])
+    big_holders = sum(1 for h in holder_pcts if h["pct"] > 1.0)
+
+    result["top1_pct"] = round(top1, 2)
+    result["top5_pct"] = round(top5, 2)
+    result["top10_pct"] = round(top10, 2)
+    result["top20_pct"] = round(top20, 2)
+    result["num_holders_above_1pct"] = big_holders
+
+    # Score concentration risk
+    conc_score = 0
+
+    if top1 > 30:
+        conc_score += 15
+        result["signals"].append(
+            f"CRITICAL: Top 1 holder owns {top1:.1f}% of supply (>30%, +15)"
+        )
+    elif top1 > 15:
+        conc_score += 10
+        result["signals"].append(
+            f"HIGH: Top 1 holder owns {top1:.1f}% of supply (>15%, +10)"
+        )
+    elif top1 > 8:
+        conc_score += 5
+        result["signals"].append(
+            f"MODERATE: Top 1 holder owns {top1:.1f}% of supply (>8%, +5)"
+        )
+
+    if top5 > 50:
+        conc_score += 10
+        result["signals"].append(
+            f"HIGH: Top 5 holders own {top5:.1f}% of supply (>50%, +10)"
+        )
+    elif top5 > 35:
+        conc_score += 5
+        result["signals"].append(
+            f"MODERATE: Top 5 holders own {top5:.1f}% of supply (>35%, +5)"
+        )
+
+    if top10 > 75:
+        conc_score += 5
+        result["signals"].append(
+            f"HIGH: Top 10 holders own {top10:.1f}% of supply (>75%, +5)"
+        )
+
+    result["concentration_score"] = conc_score
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Dev Wallet Detection
 # ---------------------------------------------------------------------------
@@ -187,6 +333,7 @@ def detect_dev_wallet(mint, mint_info):
         "detection_notes": [],
         "deployer_wallet": None,
         "first_token_recipient": None,
+        "creation_blocktime": None,  # v2.0: for token age scoring
     }
 
     # --- Method 1: Active mint authority ---
@@ -257,9 +404,16 @@ def _enrich_with_earliest_tx(mint, result):
         return
 
     # The last entry in all_sigs (oldest) is the earliest transaction
-    earliest_sig = all_sigs[-1]
-    if isinstance(earliest_sig, dict):
-        earliest_sig = earliest_sig.get("signature", "")
+    earliest_entry = all_sigs[-1]
+    earliest_sig = ""
+    if isinstance(earliest_entry, dict):
+        earliest_sig = earliest_entry.get("signature", "")
+        # v2.0: capture blockTime for token age
+        block_time = earliest_entry.get("blockTime")
+        if block_time:
+            result["creation_blocktime"] = block_time
+    elif isinstance(earliest_entry, str):
+        earliest_sig = earliest_entry
 
     if not earliest_sig:
         result["detection_notes"].append("Could not extract earliest signature")
@@ -594,7 +748,10 @@ def analyze_transactions(dev_wallet, target_mint, signatures_raw=None, provided_
 # ---------------------------------------------------------------------------
 def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
     """
-    Main analysis: returns complete risk assessment.
+    Main analysis v2.0: returns complete risk assessment with robust scoring.
+
+    Scoring philosophy: Start skeptical (98.6% of pump.fun tokens are scams).
+    Only lower risk when positive on-chain signals are confirmed.
 
     If dev_wallet is not provided, auto-detects it from the mint's
     on-chain history (deployer signer, mint authority, first recipient).
@@ -603,7 +760,9 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
     triggered_signals = []
     risk_score = 0
 
-    # -- Step 1: Mint Account Info --
+    # =====================================================================
+    # STEP 1: Mint Account Info
+    # =====================================================================
     raw_account = fetch_account_info(mint)
     mint_info = parse_mint_info(raw_account)
 
@@ -615,21 +774,24 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
 
     if parse_error:
         triggered_signals.append(f"WARN: Mint parse issue: {parse_error}")
+        risk_score += 5  # Can't verify = risky
 
-    # Authority Risk (max 30)
+    # --- Authority Risk (max 30) ---
     if mint_authority_revoked is False:
-        risk_score += 20
-        triggered_signals.append("CRITICAL: Mint authority ACTIVE — infinite mint risk (+20)")
+        risk_score += 25
+        triggered_signals.append("CRITICAL: Mint authority ACTIVE — infinite mint risk (+25)")
     elif mint_authority_revoked is True:
         triggered_signals.append("OK: Mint authority revoked")
 
     if freeze_authority_revoked is False:
-        risk_score += 10
-        triggered_signals.append("HIGH: Freeze authority ACTIVE — honeypot risk (+10)")
+        risk_score += 15
+        triggered_signals.append("HIGH: Freeze authority ACTIVE — honeypot risk (+15)")
     elif freeze_authority_revoked is True:
         triggered_signals.append("OK: Freeze authority revoked")
 
-    # -- Step 2: Auto-detect dev wallet if not provided --
+    # =====================================================================
+    # STEP 2: Auto-detect dev wallet
+    # =====================================================================
     dev_detection = None
     dev_wallet_source = "user_provided" if dev_wallet else None
 
@@ -644,9 +806,67 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
                 f"(confidence: {dev_detection['confidence']}): {dev_wallet[:8]}...{dev_wallet[-6:]}"
             )
         else:
-            triggered_signals.append("INFO: Could not auto-detect dev wallet")
+            triggered_signals.append("WARN: Could not auto-detect dev wallet — unknown origin (+8)")
+            risk_score += 8  # v2.0: unknown dev = risky
 
-    # -- Step 3: Supply Change (max 20) --
+    # =====================================================================
+    # STEP 3: Token Age (NEW in v2.0, max 15)
+    # =====================================================================
+    token_age_hours = None
+    creation_ts = None
+    if dev_detection and dev_detection.get("creation_blocktime"):
+        creation_ts = dev_detection["creation_blocktime"]
+        age_seconds = time.time() - creation_ts
+        token_age_hours = round(age_seconds / 3600, 1)
+
+        if token_age_hours < 1:
+            risk_score += 15
+            triggered_signals.append(
+                f"CRITICAL: Token is {token_age_hours:.1f}h old (<1h, extremely new, +15)"
+            )
+        elif token_age_hours < 6:
+            risk_score += 10
+            triggered_signals.append(
+                f"HIGH: Token is {token_age_hours:.1f}h old (<6h, very new, +10)"
+            )
+        elif token_age_hours < 24:
+            risk_score += 5
+            triggered_signals.append(
+                f"MODERATE: Token is {token_age_hours:.1f}h old (<24h, new, +5)"
+            )
+        elif token_age_hours < 72:
+            risk_score += 3
+            triggered_signals.append(
+                f"LOW: Token is {token_age_hours:.1f}h old (<72h, +3)"
+            )
+        else:
+            triggered_signals.append(
+                f"OK: Token is {token_age_hours:.1f}h old (>{token_age_hours/24:.0f} days)"
+            )
+    else:
+        triggered_signals.append("WARN: Could not determine token age")
+
+    # =====================================================================
+    # STEP 4: Holder Concentration (NEW in v2.0, max 25)
+    # =====================================================================
+    concentration = analyze_holder_concentration(mint, supply)
+    if concentration.get("error"):
+        triggered_signals.append(
+            f"WARN: Holder concentration check failed: {concentration['error']}"
+        )
+    else:
+        risk_score += concentration["concentration_score"]
+        triggered_signals.extend(concentration["signals"])
+        if not concentration["signals"]:
+            triggered_signals.append(
+                f"OK: Holder distribution looks reasonable "
+                f"(top1={concentration['top1_pct']}%, top5={concentration['top5_pct']}%, "
+                f"top10={concentration['top10_pct']}%)"
+            )
+
+    # =====================================================================
+    # STEP 5: Supply Change (max 20)
+    # =====================================================================
     supply_change_flag = False
     prev_snapshot = _snapshot_cache.get(mint)
     if prev_snapshot and supply:
@@ -668,7 +888,9 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
             except (ValueError, TypeError):
                 pass
 
-    # -- Step 4: Dev Holdings (max 20) --
+    # =====================================================================
+    # STEP 6: Dev Holdings (max 20) — with dev-dump penalty
+    # =====================================================================
     dev_holdings = None
     if dev_wallet:
         raw_ta = fetch_token_accounts_by_owner(dev_wallet, mint=mint)
@@ -688,56 +910,86 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         }
 
         if pct_supply is not None:
-            if pct_supply > 15:
+            if pct_supply > 20:
                 risk_score += 20
-                triggered_signals.append(f"HIGH: Dev holds {pct_supply:.1f}% of supply (>15%, +20)")
+                triggered_signals.append(
+                    f"CRITICAL: Dev holds {pct_supply:.1f}% of supply (>20%, dump risk, +20)"
+                )
             elif pct_supply > 5:
-                risk_score += 10
-                triggered_signals.append(f"MODERATE: Dev holds {pct_supply:.1f}% of supply (5-15%, +10)")
+                risk_score += 12
+                triggered_signals.append(
+                    f"HIGH: Dev holds {pct_supply:.1f}% of supply (5-20%, +12)"
+                )
+            elif pct_supply > 0.01:
+                triggered_signals.append(
+                    f"OK: Dev holds {pct_supply:.1f}% of supply (small position)"
+                )
             else:
-                triggered_signals.append(f"OK: Dev holds {pct_supply:.1f}% of supply (<5%)")
+                # v2.0 KEY CHANGE: Dev holds 0% = they already dumped everything
+                risk_score += 10
+                triggered_signals.append(
+                    f"HIGH: Dev holds 0% — already dumped all tokens (+10)"
+                )
         elif not token_accounts:
-            triggered_signals.append("INFO: Dev wallet has no token accounts for this mint")
+            # Dev wallet exists but has NO token accounts at all
+            risk_score += 10
+            triggered_signals.append(
+                "HIGH: Dev wallet has zero token accounts — fully exited (+10)"
+            )
     else:
-        triggered_signals.append("INFO: No dev wallet found — dev exposure skipped")
+        if not dev_detection:
+            triggered_signals.append("INFO: No dev wallet provided — dev exposure skipped")
 
-    # -- Step 5: Transaction Signals (max 30) --
+    # =====================================================================
+    # STEP 7: Transaction Signals (max 20)
+    # =====================================================================
     tx_signals = {
         "large_outbound_count": 0, "fanout_flag": False,
-        "total_tx_analyzed": 0, "unique_destination_count": 0, "notes": [],
+        "total_tx_analyzed": 0, "unique_destination_count": 0,
+        "dev_recent_tx_count": 0, "notes": [],
     }
 
     if dev_wallet or recent_signatures:
         tx_signals = analyze_transactions(dev_wallet, mint, provided_sigs=recent_signatures)
 
         if tx_signals["large_outbound_count"] > 0:
-            risk_score += 15
+            risk_score += 10
             triggered_signals.append(
-                f"HIGH: {tx_signals['large_outbound_count']} outbound transfers from dev (+15)"
+                f"HIGH: {tx_signals['large_outbound_count']} outbound transfers from dev (+10)"
             )
         if tx_signals["fanout_flag"]:
-            risk_score += 15
+            risk_score += 10
             triggered_signals.append(
-                f"HIGH: Fan-out to {tx_signals['unique_destination_count']} wallets (+15)"
+                f"HIGH: Fan-out to {tx_signals['unique_destination_count']} wallets (+10)"
+            )
+
+        # v2.0: Check if dev wallet is a ghost (no recent activity)
+        if dev_wallet and tx_signals["total_tx_analyzed"] == 0:
+            risk_score += 5
+            triggered_signals.append(
+                "MODERATE: Dev wallet has no analyzable recent transactions — ghost wallet (+5)"
             )
     else:
         triggered_signals.append("INFO: No dev wallet/signatures — tx analysis skipped")
 
-    # -- Step 6: Decision --
+    # =====================================================================
+    # STEP 8: Decision — STRICTER THRESHOLDS (v2.0)
+    # =====================================================================
     risk_score = min(risk_score, 100)
 
-    if risk_score <= 25:
+    if risk_score <= 10:
         decision, risk_level = "BUY", "LOW"
-    elif risk_score <= 50:
+    elif risk_score <= 35:
         decision, risk_level = "CAUTION", "MODERATE"
-    elif risk_score <= 75:
+    elif risk_score <= 60:
         decision, risk_level = "NO_BUY", "HIGH"
     else:
         decision, risk_level = "NO_BUY", "EXTREME"
 
+    # Override: supply inflated + mint authority active = always EXTREME
     if supply_change_flag and mint_authority_revoked is False:
         decision, risk_level = "NO_BUY", "EXTREME"
-        risk_score = max(risk_score, 80)
+        risk_score = max(risk_score, 85)
 
     result = {
         "mint": mint,
@@ -745,6 +997,18 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "freeze_authority_revoked": freeze_authority_revoked,
         "supply": supply,
         "decimals": decimals,
+        "token_age_hours": token_age_hours,
+        "creation_timestamp": (
+            datetime.fromtimestamp(creation_ts, tz=timezone.utc).isoformat()
+            if creation_ts else None
+        ),
+        "holder_concentration": {
+            "top1_pct": concentration.get("top1_pct"),
+            "top5_pct": concentration.get("top5_pct"),
+            "top10_pct": concentration.get("top10_pct"),
+            "top20_pct": concentration.get("top20_pct"),
+            "num_holders_above_1pct": concentration.get("num_holders_above_1pct"),
+        },
         "dev_wallet_detection": dev_detection,
         "dev_holdings": dev_holdings,
         "tx_signals": tx_signals,
@@ -754,6 +1018,7 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "decision": decision,
         "triggered_signals": triggered_signals,
         "timestamp": timestamp,
+        "version": "2.0.0",
     }
 
     _cache_set(_snapshot_cache, mint, {
@@ -777,9 +1042,11 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "1.2.0",
+        "version": "2.0.0",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
-                      "dev_holdings", "tx_pattern_analysis"],
+                      "dev_holdings", "tx_pattern_analysis",
+                      "holder_concentration", "token_age", "dev_dump_penalty",
+                      "strict_thresholds"],
         "rpc_endpoint": SOLANA_RPC_URL[:50] + "...",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
@@ -833,7 +1100,7 @@ def root():
     return jsonify({
         "service": "Rapid Rug Filter",
         "description": "Solana meme coin structural rug risk scanner with auto dev wallet detection",
-        "version": "1.2.0",
+        "version": "2.0.0",
         "endpoints": {
             "GET /health": "Health check",
             "POST /analyze": "Analyze token mint for rug risk (auto-detects dev wallet)",

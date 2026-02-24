@@ -2,9 +2,9 @@
 Rapid Rug Filter - Solana Meme Coin Structural Rug Risk Scanner
 Production-grade REST API microservice for OnDemand agent tool calling.
 
-v2.0.0 — Robust scoring overhaul: holder concentration analysis,
-token age detection, dev-dump penalty, stricter thresholds.
-Uses Solana JSON-RPC directly (public mainnet endpoint or Helius).
+v2.1.0 — Helius Developer RPC (10M credits/mo, 50 RPS).
+Robust scoring: holder concentration, token age, dev-dump penalty, strict thresholds.
+Uses Solana JSON-RPC directly via Helius dedicated endpoint.
 No RapidAPI dependency — calls Solana chain nodes directly for speed.
 """
 
@@ -1018,7 +1018,7 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "decision": decision,
         "triggered_signals": triggered_signals,
         "timestamp": timestamp,
-        "version": "2.0.0",
+        "version": "2.1.0",
     }
 
     _cache_set(_snapshot_cache, mint, {
@@ -1042,7 +1042,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
                       "dev_holdings", "tx_pattern_analysis",
                       "holder_concentration", "token_age", "dev_dump_penalty",
@@ -1100,7 +1100,7 @@ def root():
     return jsonify({
         "service": "Rapid Rug Filter",
         "description": "Solana meme coin structural rug risk scanner with auto dev wallet detection",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "endpoints": {
             "GET /health": "Health check",
             "POST /analyze": "Analyze token mint for rug risk (auto-detects dev wallet)",

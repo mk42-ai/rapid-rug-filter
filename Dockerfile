@@ -12,4 +12,4 @@ ENV SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=f69e06c4-795c-426c-b5
 
 EXPOSE 3000
 
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:3000", "--workers", "2", "--timeout", "30"]
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:3000", "--workers", "1", "--threads", "4", "--timeout", "30"]

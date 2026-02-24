@@ -2,7 +2,11 @@
 Rapid Rug Filter - Solana Meme Coin Structural Rug Risk Scanner
 Production-grade REST API microservice for OnDemand agent tool calling.
 
-v2.1.0 — Helius Developer RPC (10M credits/mo, 50 RPS).
+v3.0.0 — Whale + Dev Surveillance Service.
+Adds continuous monitoring after entry: /watch, /status, /alerts, /unwatch.
+Detects dev dumping, whale exits, distribution patterns in real-time.
+
+Built on v2.1.0 — Helius Developer RPC (10M credits/mo, 50 RPS).
 Robust scoring: holder concentration, token age, dev-dump penalty, strict thresholds.
 Uses Solana JSON-RPC directly via Helius dedicated endpoint.
 No RapidAPI dependency — calls Solana chain nodes directly for speed.
@@ -13,7 +17,10 @@ import time
 import json
 import struct
 import base64
+import threading
+import copy
 from datetime import datetime, timezone
+from collections import deque
 from flask import Flask, request, jsonify
 
 import requests as http_requests
@@ -48,6 +55,54 @@ SYSTEM_ADDRESSES = {
     "TSWAPaqyCSx2KABk68Shruf4rp7CxcNi8hAsbdwmHbN",  # Tensor
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun program
 }
+
+# ---------------------------------------------------------------------------
+# Surveillance Configuration (v3.0)
+# ---------------------------------------------------------------------------
+MONITOR_DEFAULT_INTERVAL = 10    # seconds between polls per mint
+MONITOR_MAX_MINTS = 10           # max concurrent watches
+MONITOR_HISTORY_MAXLEN = 60      # rolling snapshot history (~10 min at 10s)
+
+# Dev dump thresholds
+DEV_DUMP_THRESHOLD_PCT = 5.0       # 5% drop from entry within 5 min → HIGH
+DEV_SEVERE_DUMP_THRESHOLD_PCT = 10.0  # 10% drop from entry at any time → EXTREME
+DEV_FANOUT_MIN_WALLETS = 3        # dev sends to 3+ wallets within 5 min → HIGH
+
+# Whale thresholds
+WHALE_TOP1_DUMP_SUPPLY_PCT = 2.0   # top1 holder loses 2% of supply in 5 min → HIGH
+WHALE_ANY_DUMP_SUPPLY_PCT = 1.0    # any top10 loses 1% of supply in 5 min → MODERATE
+WHALE_AGG_DROP_PCT = 5.0           # sum(topN) drops 5% from entry in 10 min → HIGH
+WHALE_FANOUT_MIN_WALLETS = 3       # any whale sends to 3+ wallets in 5 min → MODERATE
+
+# Known exchange deposit addresses (Solana hot wallets)
+KNOWN_EXCHANGE_ADDRESSES = {
+    # Binance
+    "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+    "2ojv9BAiHUrvsm9gxDe7fJSzbNZSJcxZvf8dqmWGHG8S",
+    # Coinbase
+    "GJRs4FwHtemZ5ZE9x3FNvJ8TMwitKTh21yxdRPqn7npE",
+    "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS",
+    "2AQdpHJ2JpcEgPiATUXjQxA8QmafFegfQwSLWSprPicm",
+    # OKX
+    "5VCwKtCXgCJ6kit5FybXjvFnPe2FKEV4NMF4gD5MiSyn",
+    "JBGUGVkCYBe24KMTGE2TvoEU1EBJHvTGPDqnNJKbLXiW",
+    # Bybit
+    "AC5RDfQFmDS1deWZos921JfqscXdByf2BqcRbZES4VVk",
+    # Kraken
+    "FWznbcNXWQuHTawe9RxvQ2LdCENssh12dsznf4RiouN5",
+    "CnXhMid6m8FKM9u7o95qXdZtaXq3yJLcQB3Uq2hTj2sM",
+}
+
+# ---------------------------------------------------------------------------
+# Surveillance Global State (v3.0)
+# ---------------------------------------------------------------------------
+_watched_mints = {}            # mint -> entry dict
+_watched_mints_lock = threading.Lock()
+_global_alerts = deque(maxlen=200)
+_global_alerts_lock = threading.Lock()
+_monitor_thread = None
+_monitor_stop_event = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +799,398 @@ def analyze_transactions(dev_wallet, target_mint, signatures_raw=None, provided_
 
 
 # ---------------------------------------------------------------------------
+# Surveillance Helpers (v3.0)
+# ---------------------------------------------------------------------------
+def _resolve_whale_owners(mint, holders_raw, top_n=10):
+    """
+    Resolve token account addresses from getTokenLargestAccounts to wallet owners.
+    Returns list of (owner_wallet, balance_amount) tuples.
+    """
+    holders = holders_raw.get("result", {}).get("value", [])
+    if not holders:
+        return []
+    resolved = []
+    for h in holders[:top_n]:
+        token_acct = h.get("address", "")
+        amount = int(h.get("amount", "0"))
+        if amount <= 0:
+            continue
+        owner = _resolve_token_account_owner(token_acct)
+        if owner and owner not in SYSTEM_ADDRESSES and owner not in KNOWN_EXCHANGE_ADDRESSES:
+            resolved.append((owner, amount))
+    return resolved
+
+
+def _get_wallet_balance_for_mint(wallet, mint):
+    """Get a wallet's token balance for a specific mint. Returns int amount."""
+    raw = fetch_token_accounts_by_owner(wallet, mint=mint)
+    accounts = parse_token_accounts_for_mint(raw, mint)
+    if accounts:
+        return int(accounts[0].get("amount", "0"))
+    return 0
+
+
+def _take_snapshot(mint, dev_wallet, whale_wallets, supply):
+    """Capture dev + whale balances at current moment."""
+    dev_balance = 0
+    if dev_wallet:
+        dev_balance = _get_wallet_balance_for_mint(dev_wallet, mint)
+
+    whale_balances = {}
+    whale_total = 0
+    for w in whale_wallets:
+        bal = _get_wallet_balance_for_mint(w, mint)
+        whale_balances[w] = bal
+        whale_total += bal
+
+    return {
+        "dev_balance": dev_balance,
+        "whale_balances": whale_balances,
+        "whale_total": whale_total,
+        "timestamp": time.time(),
+    }
+
+
+def _detect_fanout_from_recent_tx(wallet, mint, time_window=300):
+    """
+    Check if wallet has sent tokens to many distinct wallets recently.
+    Returns set of destination wallets.
+    """
+    destinations = set()
+    sigs_raw = fetch_signatures_for_address(wallet, limit=10)
+    if not sigs_raw or "error" in sigs_raw:
+        return destinations
+
+    now = time.time()
+    sigs = sigs_raw.get("result", [])
+
+    for s in sigs[:8]:
+        if not isinstance(s, dict):
+            continue
+        block_time = s.get("blockTime")
+        if block_time and (now - block_time) > time_window:
+            continue  # Too old
+        sig = s.get("signature", "")
+        if not sig:
+            continue
+
+        tx_raw = fetch_transaction(sig)
+        if not tx_raw or "error" in tx_raw:
+            continue
+        tx_result = tx_raw.get("result")
+        if not tx_result:
+            continue
+
+        meta = tx_result.get("meta", {})
+        if not meta:
+            continue
+
+        pre_token = meta.get("preTokenBalances") or []
+        post_token = meta.get("postTokenBalances") or []
+
+        pre_map = {}
+        for b in pre_token:
+            if isinstance(b, dict) and b.get("mint") == mint:
+                idx = b.get("accountIndex")
+                owner = b.get("owner", "")
+                amt = int((b.get("uiTokenAmount") or {}).get("amount", "0"))
+                pre_map[idx] = (owner, amt)
+
+        for b in post_token:
+            if isinstance(b, dict) and b.get("mint") == mint:
+                idx = b.get("accountIndex")
+                owner = b.get("owner", "")
+                post_amt = int((b.get("uiTokenAmount") or {}).get("amount", "0"))
+                pre_owner, pre_amt = pre_map.get(idx, (owner, 0))
+
+                # If this wallet sent tokens (balance decreased) and another received
+                if owner and owner != wallet and owner not in SYSTEM_ADDRESSES:
+                    # Check that sender's balance decreased
+                    for pidx, (po, pa) in pre_map.items():
+                        if po == wallet and pa > 0:
+                            destinations.add(owner)
+                            break
+
+    return destinations
+
+
+def _create_alert(mint, trigger, severity, message, details=None):
+    """Build an alert dict and append to per-mint and global stores."""
+    alert = {
+        "trigger": trigger,
+        "severity": severity,
+        "message": message,
+        "details": details or {},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mint": mint,
+    }
+    return alert
+
+
+def _update_severity(entry):
+    """Recompute highest severity from alerts list."""
+    severity_order = {"NONE": 0, "LOW": 1, "MODERATE": 2, "HIGH": 3, "EXTREME": 4}
+    highest = "NONE"
+    for a in entry.get("alerts", []):
+        s = a.get("severity", "NONE")
+        if severity_order.get(s, 0) > severity_order.get(highest, 0):
+            highest = s
+    entry["severity"] = highest
+
+
+def _balance_at_time_ago(history, key, window):
+    """Find balance value from snapshot closest to N seconds ago."""
+    now = time.time()
+    target = now - window
+    best = None
+    best_diff = float("inf")
+    for ts, snap in history:
+        diff = abs(ts - target)
+        if diff < best_diff:
+            best_diff = diff
+            best = snap.get(key, 0)
+    return best
+
+
+def _whale_balance_at_time_ago(history, wallet, window):
+    """Find a specific whale's balance from snapshot closest to N seconds ago."""
+    now = time.time()
+    target = now - window
+    best = None
+    best_diff = float("inf")
+    for ts, snap in history:
+        diff = abs(ts - target)
+        if diff < best_diff:
+            best_diff = diff
+            best = snap.get("whale_balances", {}).get(wallet, 0)
+    return best
+
+
+def _calc_change_pct(entry_val, current_val):
+    """Percentage change: negative means decrease."""
+    if entry_val <= 0:
+        return 0.0
+    return ((current_val - entry_val) / entry_val) * 100.0
+
+
+# ---------------------------------------------------------------------------
+# Trigger Evaluation (v3.0)
+# ---------------------------------------------------------------------------
+def _evaluate_triggers(entry, current_snap, dev_fanout_dests, whale_fanout_results):
+    """
+    Evaluate all triggers for a watched mint. Returns list of new alerts.
+    Mutates entry flags in place.
+    """
+    new_alerts = []
+    mint = entry["mint"]
+    supply = int(entry["supply"]) if entry["supply"] else 0
+    entry_snap = entry["entry_snapshot"]
+    history = entry["history"]
+    flags = entry["flags"]
+
+    # ---- DEV TRIGGERS ----
+    if entry.get("dev_wallet") and entry_snap.get("dev_balance", 0) > 0:
+        entry_dev = entry_snap["dev_balance"]
+        current_dev = current_snap.get("dev_balance", 0)
+        dev_5min_ago = _balance_at_time_ago(history, "dev_balance", 300)
+
+        # DEV_DUMP: dev balance drops >=5% of entry balance within 5 min
+        if dev_5min_ago is not None and dev_5min_ago > 0:
+            drop_from_5min = _calc_change_pct(dev_5min_ago, current_dev)
+            if drop_from_5min <= -DEV_DUMP_THRESHOLD_PCT and not flags.get("dev_dump_flag"):
+                flags["dev_dump_flag"] = True
+                alert = _create_alert(mint, "DEV_DUMP", "HIGH",
+                    f"Dev balance dropped {abs(drop_from_5min):.1f}% in last 5 min",
+                    {"dev_5min_ago": dev_5min_ago, "dev_now": current_dev})
+                new_alerts.append(alert)
+
+        # DEV_SEVERE_DUMP: dev balance drops >=10% from entry at any time
+        drop_from_entry = _calc_change_pct(entry_dev, current_dev)
+        if drop_from_entry <= -DEV_SEVERE_DUMP_THRESHOLD_PCT and not flags.get("dev_severe_dump_flag"):
+            flags["dev_severe_dump_flag"] = True
+            alert = _create_alert(mint, "DEV_SEVERE_DUMP", "EXTREME",
+                f"Dev balance dropped {abs(drop_from_entry):.1f}% from entry",
+                {"entry_dev": entry_dev, "dev_now": current_dev})
+            new_alerts.append(alert)
+
+        # DEV_FANOUT: dev sends to >=3 distinct wallets within 5 min
+        if len(dev_fanout_dests) >= DEV_FANOUT_MIN_WALLETS and not flags.get("dev_distribution_flag"):
+            flags["dev_distribution_flag"] = True
+            alert = _create_alert(mint, "DEV_FANOUT", "HIGH",
+                f"Dev distributed tokens to {len(dev_fanout_dests)} wallets",
+                {"destinations": list(dev_fanout_dests)[:10]})
+            new_alerts.append(alert)
+
+    # ---- WHALE TRIGGERS ----
+    if supply > 0 and entry.get("whale_wallets"):
+        whale_wallets = entry["whale_wallets"]
+        current_whale_bals = current_snap.get("whale_balances", {})
+        entry_whale_total = entry_snap.get("whale_total", 0)
+        current_whale_total = current_snap.get("whale_total", 0)
+
+        # Check each whale
+        for i, w in enumerate(whale_wallets):
+            current_bal = current_whale_bals.get(w, 0)
+            bal_5min_ago = _whale_balance_at_time_ago(history, w, 300)
+
+            if bal_5min_ago is not None and bal_5min_ago > 0:
+                drop_tokens = bal_5min_ago - current_bal
+                drop_supply_pct = (drop_tokens / supply) * 100.0
+
+                # WHALE_TOP1_DUMP: top1 holder loses >=2% of total supply in 5 min
+                if i == 0 and drop_supply_pct >= WHALE_TOP1_DUMP_SUPPLY_PCT and not flags.get("whale_dump_flag"):
+                    flags["whale_dump_flag"] = True
+                    alert = _create_alert(mint, "WHALE_TOP1_DUMP", "HIGH",
+                        f"Top1 whale lost {drop_supply_pct:.1f}% of total supply in 5 min",
+                        {"wallet": w[:12] + "...", "drop_tokens": drop_tokens})
+                    new_alerts.append(alert)
+
+                # WHALE_ANY_DUMP: any top10 loses >=1% of supply in 5 min
+                elif drop_supply_pct >= WHALE_ANY_DUMP_SUPPLY_PCT:
+                    alert = _create_alert(mint, "WHALE_ANY_DUMP", "MODERATE",
+                        f"Whale #{i+1} lost {drop_supply_pct:.1f}% of total supply in 5 min",
+                        {"wallet": w[:12] + "...", "drop_tokens": drop_tokens})
+                    new_alerts.append(alert)
+
+            # WHALE_EXCHANGE_EXIT: whale sends to known exchange
+            if w in whale_fanout_results:
+                for dest in whale_fanout_results[w]:
+                    if dest in KNOWN_EXCHANGE_ADDRESSES and not flags.get("top_holder_exit_flag"):
+                        flags["top_holder_exit_flag"] = True
+                        alert = _create_alert(mint, "WHALE_EXCHANGE_EXIT", "HIGH",
+                            f"Whale #{i+1} sent tokens to exchange address",
+                            {"wallet": w[:12] + "...", "exchange": dest[:12] + "..."})
+                        new_alerts.append(alert)
+
+        # WHALE_FANOUT: any tracked whale sends to >=3 wallets in 5 min
+        for w, dests in whale_fanout_results.items():
+            if len(dests) >= WHALE_FANOUT_MIN_WALLETS:
+                alert = _create_alert(mint, "WHALE_FANOUT", "MODERATE",
+                    f"Whale sent to {len(dests)} distinct wallets in 5 min",
+                    {"wallet": w[:12] + "...", "destinations": list(dests)[:5]})
+                new_alerts.append(alert)
+
+        # WHALE_AGG_DISTRIBUTION: sum(topN) drops >=5% from entry within 10 min
+        if entry_whale_total > 0:
+            agg_drop = _calc_change_pct(entry_whale_total, current_whale_total)
+            if agg_drop <= -WHALE_AGG_DROP_PCT and not flags.get("whale_distribution_flag"):
+                flags["whale_distribution_flag"] = True
+                alert = _create_alert(mint, "WHALE_AGG_DISTRIBUTION", "HIGH",
+                    f"Top whale aggregate holdings dropped {abs(agg_drop):.1f}% from entry",
+                    {"entry_total": entry_whale_total, "current_total": current_whale_total})
+                new_alerts.append(alert)
+
+    return new_alerts
+
+
+# ---------------------------------------------------------------------------
+# Monitor Loop (v3.0)
+# ---------------------------------------------------------------------------
+def _poll_single_mint(mint):
+    """Poll a single watched mint: fetch balances, check fan-out, evaluate triggers."""
+    with _watched_mints_lock:
+        if mint not in _watched_mints:
+            return
+        entry = copy.deepcopy(_watched_mints[mint])
+
+    dev_wallet = entry.get("dev_wallet")
+    whale_wallets = entry.get("whale_wallets", [])
+    supply_str = entry.get("supply")
+
+    # Take current snapshot (RPC calls outside lock)
+    current_snap = _take_snapshot(mint, dev_wallet, whale_wallets, supply_str)
+
+    # Check dev fan-out
+    dev_fanout_dests = set()
+    if dev_wallet:
+        try:
+            dev_fanout_dests = _detect_fanout_from_recent_tx(dev_wallet, mint, time_window=300)
+        except Exception:
+            pass
+
+    # Check whale fan-out (only top1 to limit RPC budget)
+    whale_fanout_results = {}
+    if whale_wallets:
+        try:
+            top1 = whale_wallets[0]
+            dests = _detect_fanout_from_recent_tx(top1, mint, time_window=300)
+            if dests:
+                whale_fanout_results[top1] = dests
+        except Exception:
+            pass
+
+    # Evaluate triggers
+    new_alerts = _evaluate_triggers(entry, current_snap, dev_fanout_dests, whale_fanout_results)
+
+    # Write results back under lock
+    with _watched_mints_lock:
+        if mint not in _watched_mints:
+            return
+        live = _watched_mints[mint]
+        live["current_snapshot"] = current_snap
+        live["history"].append((current_snap["timestamp"], current_snap))
+        live["last_checked"] = time.time()
+        live["flags"] = entry["flags"]  # Updated by _evaluate_triggers
+        for a in new_alerts:
+            live["alerts"].append(a)
+        _update_severity(live)
+
+    # Append to global alerts
+    if new_alerts:
+        with _global_alerts_lock:
+            for a in new_alerts:
+                _global_alerts.append(a)
+
+
+def _monitor_loop():
+    """Daemon thread: poll watched mints at their configured intervals."""
+    while not _monitor_stop_event.is_set():
+        try:
+            with _watched_mints_lock:
+                mints_to_poll = []
+                now = time.time()
+                for mint, entry in _watched_mints.items():
+                    interval = entry.get("poll_interval", MONITOR_DEFAULT_INTERVAL)
+                    last = entry.get("last_checked", 0)
+                    if (now - last) >= interval:
+                        mints_to_poll.append(mint)
+
+            for mint in mints_to_poll:
+                if _monitor_stop_event.is_set():
+                    break
+                try:
+                    _poll_single_mint(mint)
+                except Exception as e:
+                    # Log but don't crash the monitor
+                    print(f"[MONITOR] Error polling {mint[:12]}...: {e}")
+                time.sleep(0.5)  # Small gap between mints to spread RPC load
+
+        except Exception as e:
+            print(f"[MONITOR] Loop error: {e}")
+
+        _monitor_stop_event.wait(2)  # Check every 2 seconds for mints to poll
+
+
+def _start_monitor_thread():
+    """Lazy-start the monitor daemon thread."""
+    global _monitor_thread
+    if _monitor_thread and _monitor_thread.is_alive():
+        return
+    _monitor_stop_event.clear()
+    _monitor_thread = threading.Thread(target=_monitor_loop, daemon=True, name="rug-monitor")
+    _monitor_thread.start()
+
+
+def _stop_monitor_thread():
+    """Stop the monitor thread (called on last unwatch)."""
+    global _monitor_thread
+    _monitor_stop_event.set()
+    if _monitor_thread:
+        _monitor_thread.join(timeout=5)
+        _monitor_thread = None
+
+
+# ---------------------------------------------------------------------------
 # Core Analysis Engine
 # ---------------------------------------------------------------------------
 def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
@@ -1018,7 +1465,7 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "decision": decision,
         "triggered_signals": triggered_signals,
         "timestamp": timestamp,
-        "version": "2.1.0",
+        "version": "3.0.0",
     }
 
     _cache_set(_snapshot_cache, mint, {
@@ -1039,14 +1486,28 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
+    with _watched_mints_lock:
+        watched_count = len(_watched_mints)
+        watched_list = list(_watched_mints.keys())
+    with _global_alerts_lock:
+        alert_count = len(_global_alerts)
+
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "2.1.0",
+        "version": "3.0.0",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
                       "dev_holdings", "tx_pattern_analysis",
                       "holder_concentration", "token_age", "dev_dump_penalty",
-                      "strict_thresholds"],
+                      "strict_thresholds", "whale_surveillance", "dev_dump_monitor",
+                      "fanout_detection", "exchange_exit_detection"],
+        "surveillance": {
+            "active": _monitor_thread is not None and _monitor_thread.is_alive(),
+            "watched_mints": watched_count,
+            "watched_list": watched_list,
+            "total_alerts": alert_count,
+            "max_capacity": MONITOR_MAX_MINTS,
+        },
         "rpc_endpoint": SOLANA_RPC_URL[:50] + "...",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
@@ -1095,21 +1556,258 @@ def snapshot_endpoint():
     return jsonify({"mint": mint, "snapshot": None, "message": "No snapshot. Run /analyze first."}), 404
 
 
+# ---------------------------------------------------------------------------
+# Surveillance Routes (v3.0)
+# ---------------------------------------------------------------------------
+@app.route("/watch", methods=["POST"])
+def watch_endpoint():
+    """Register a mint for continuous surveillance after entry."""
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be valid JSON"}), 400
+
+    mint = data.get("mint")
+    if not mint or not isinstance(mint, str) or len(mint) < 32:
+        return jsonify({"error": "Missing or invalid 'mint'. Must be a Solana mint address."}), 400
+
+    poll_interval = data.get("poll_interval", MONITOR_DEFAULT_INTERVAL)
+
+    with _watched_mints_lock:
+        if mint in _watched_mints:
+            return jsonify({
+                "status": "already_watching",
+                "mint": mint,
+                "entry_timestamp": _watched_mints[mint]["entry_timestamp"],
+            }), 200
+        if len(_watched_mints) >= MONITOR_MAX_MINTS:
+            return jsonify({
+                "error": f"Max {MONITOR_MAX_MINTS} concurrent watches. Unwatch a mint first.",
+                "currently_watching": list(_watched_mints.keys()),
+            }), 429
+
+    try:
+        # Fetch mint info
+        raw_mint = fetch_account_info(mint)
+        mint_info = parse_mint_info(raw_mint)
+        supply = mint_info.get("supply")
+        decimals = mint_info.get("decimals")
+
+        if not supply:
+            return jsonify({"error": "Could not fetch mint info or supply is null", "mint": mint}), 400
+
+        # Detect dev wallet
+        dev_detection = detect_dev_wallet(mint, mint_info)
+        dev_wallet = dev_detection.get("probable_dev_wallet")
+        dev_confidence = dev_detection.get("confidence", "none")
+
+        # Resolve whale wallets (top 10)
+        holders_raw = fetch_token_largest_accounts(mint)
+        whale_owners = _resolve_whale_owners(mint, holders_raw, top_n=10)
+        whale_wallets = [w for w, _ in whale_owners]
+
+        # Take entry snapshot
+        entry_snapshot = _take_snapshot(mint, dev_wallet, whale_wallets, supply)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        entry = {
+            "mint": mint,
+            "entry_timestamp": now_iso,
+            "dev_wallet": dev_wallet,
+            "dev_confidence": dev_confidence,
+            "whale_wallets": whale_wallets,
+            "supply": supply,
+            "decimals": decimals,
+            "entry_snapshot": entry_snapshot,
+            "current_snapshot": entry_snapshot,
+            "history": deque(maxlen=MONITOR_HISTORY_MAXLEN),
+            "flags": {
+                "dev_dump_flag": False,
+                "dev_severe_dump_flag": False,
+                "dev_distribution_flag": False,
+                "whale_dump_flag": False,
+                "whale_distribution_flag": False,
+                "top_holder_exit_flag": False,
+            },
+            "alerts": [],
+            "severity": "NONE",
+            "last_checked": time.time(),
+            "poll_interval": poll_interval,
+        }
+        entry["history"].append((entry_snapshot["timestamp"], entry_snapshot))
+
+        with _watched_mints_lock:
+            _watched_mints[mint] = entry
+
+        # Start monitor if not running
+        _start_monitor_thread()
+
+        return jsonify({
+            "status": "watching",
+            "mint": mint,
+            "dev_wallet": dev_wallet,
+            "dev_confidence": dev_confidence,
+            "whale_wallets_count": len(whale_wallets),
+            "entry_snapshot": {
+                "dev_balance": entry_snapshot["dev_balance"],
+                "whale_total": entry_snapshot["whale_total"],
+                "timestamp": now_iso,
+            },
+            "poll_interval": poll_interval,
+            "supply": supply,
+        }), 201
+
+    except Exception as e:
+        return jsonify({
+            "error": "watch_failed",
+            "detail": str(e)[:500],
+            "mint": mint,
+        }), 500
+
+
+@app.route("/status", methods=["GET"])
+def status_endpoint():
+    """Get current surveillance status and flags for a watched mint."""
+    mint = request.args.get("mint")
+    if not mint:
+        return jsonify({"error": "Missing 'mint' query parameter"}), 400
+
+    with _watched_mints_lock:
+        if mint not in _watched_mints:
+            return jsonify({"error": "Mint not being watched", "mint": mint}), 404
+        entry = copy.deepcopy(_watched_mints[mint])
+
+    supply = int(entry["supply"]) if entry["supply"] else 0
+    entry_snap = entry["entry_snapshot"]
+    current_snap = entry["current_snapshot"]
+
+    # Calculate change percentages
+    dev_change_pct = None
+    if entry_snap.get("dev_balance", 0) > 0:
+        dev_change_pct = round(_calc_change_pct(
+            entry_snap["dev_balance"], current_snap.get("dev_balance", 0)), 2)
+
+    whale_change_pct = None
+    if entry_snap.get("whale_total", 0) > 0:
+        whale_change_pct = round(_calc_change_pct(
+            entry_snap["whale_total"], current_snap.get("whale_total", 0)), 2)
+
+    # Convert history deque to serializable list count
+    history_len = len(entry.get("history", []))
+
+    return jsonify({
+        "mint": mint,
+        "status": "watching",
+        "entry_timestamp": entry["entry_timestamp"],
+        "last_checked": datetime.fromtimestamp(
+            entry["last_checked"], tz=timezone.utc).isoformat() if entry["last_checked"] else None,
+        "flags": entry["flags"],
+        "severity": entry["severity"],
+        "dev_wallet": entry.get("dev_wallet"),
+        "dev_confidence": entry.get("dev_confidence"),
+        "whale_wallets_count": len(entry.get("whale_wallets", [])),
+        "entry_snapshot": {
+            "dev_balance": entry_snap.get("dev_balance", 0),
+            "whale_total": entry_snap.get("whale_total", 0),
+        },
+        "current_snapshot": {
+            "dev_balance": current_snap.get("dev_balance", 0),
+            "whale_total": current_snap.get("whale_total", 0),
+        },
+        "changes": {
+            "dev_balance_change_pct": dev_change_pct,
+            "whale_total_change_pct": whale_change_pct,
+        },
+        "history_snapshots": history_len,
+        "alerts_count": len(entry.get("alerts", [])),
+        "recent_alerts": entry.get("alerts", [])[-5:],  # Last 5
+        "poll_interval": entry.get("poll_interval", MONITOR_DEFAULT_INTERVAL),
+    })
+
+
+@app.route("/alerts", methods=["GET"])
+def alerts_endpoint():
+    """Get all surveillance alerts, with optional mint and severity filters."""
+    mint_filter = request.args.get("mint")
+    severity_filter = request.args.get("severity")
+
+    with _global_alerts_lock:
+        all_alerts = list(_global_alerts)
+
+    if mint_filter:
+        all_alerts = [a for a in all_alerts if a.get("mint") == mint_filter]
+    if severity_filter:
+        all_alerts = [a for a in all_alerts if a.get("severity") == severity_filter.upper()]
+
+    return jsonify({
+        "total": len(all_alerts),
+        "alerts": all_alerts[-50:],  # Last 50
+        "filters": {
+            "mint": mint_filter,
+            "severity": severity_filter,
+        },
+    })
+
+
+@app.route("/unwatch", methods=["POST"])
+def unwatch_endpoint():
+    """Stop watching a mint."""
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be valid JSON"}), 400
+
+    mint = data.get("mint")
+    if not mint:
+        return jsonify({"error": "Missing 'mint' in request body"}), 400
+
+    with _watched_mints_lock:
+        if mint not in _watched_mints:
+            return jsonify({"error": "Mint not being watched", "mint": mint}), 404
+
+        entry = _watched_mints.pop(mint)
+        remaining = len(_watched_mints)
+
+    # Stop monitor if no more mints
+    if remaining == 0:
+        _stop_monitor_thread()
+
+    return jsonify({
+        "status": "unwatched",
+        "mint": mint,
+        "was_watching_since": entry.get("entry_timestamp"),
+        "final_severity": entry.get("severity", "NONE"),
+        "total_alerts": len(entry.get("alerts", [])),
+        "flags": entry.get("flags", {}),
+        "remaining_watches": remaining,
+    })
+
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
         "service": "Rapid Rug Filter",
-        "description": "Solana meme coin structural rug risk scanner with auto dev wallet detection",
-        "version": "2.1.0",
+        "description": "Solana meme coin rug risk scanner with whale + dev surveillance",
+        "version": "3.0.0",
         "endpoints": {
-            "GET /health": "Health check",
+            "GET /health": "Health check with surveillance status",
             "POST /analyze": "Analyze token mint for rug risk (auto-detects dev wallet)",
-            "GET /snapshot?mint=...": "Get cached snapshot",
+            "GET /snapshot?mint=...": "Get cached analysis snapshot",
+            "POST /watch": "Start continuous surveillance on a mint after entry",
+            "GET /status?mint=...": "Get surveillance flags, severity, and change percentages",
+            "GET /alerts": "Get all surveillance alerts (filter by ?mint= and ?severity=)",
+            "POST /unwatch": "Stop watching a mint after exit",
         },
         "analyze_body": {
             "mint": "(required) Solana token mint address",
             "dev_wallet": "(optional) Override dev wallet — auto-detected if omitted",
             "recent_signatures": "(optional) List of tx signatures to analyze",
+        },
+        "watch_body": {
+            "mint": "(required) Solana token mint address to watch",
+            "poll_interval": "(optional) Seconds between polls, default 10",
+        },
+        "unwatch_body": {
+            "mint": "(required) Solana token mint address to stop watching",
         },
     })
 

@@ -2,11 +2,12 @@
 Rapid Rug Filter - Solana Meme Coin Structural Rug Risk Scanner
 Production-grade REST API microservice for OnDemand agent tool calling.
 
-v4.0.0 — Auto-Sell Guardian + Liquidity Pool Analysis.
-Adds Jupiter-powered emergency auto-sell directly in the surveillance loop.
-Adds LP lock/burn verification for pre-entry liquidity checks.
-When surveillance detects HIGH/EXTREME severity, the same thread that detects
-the rug also executes the sell via Jupiter — zero agent latency.
+v4.1.0 — Auto-Sell Guardian + Priority Fee Bribe + LP Analysis.
+Jupiter-powered emergency auto-sell with priority fee bribes.
+Validators prioritize our sell tx via high ComputeUnitPrice when everyone
+is panic-selling during a rug — our tx gets included while liquidity exists.
+Emergency profile: high CU price + wide slippage + 3 retries + skipPreflight.
+LP lock/burn verification for pre-entry liquidity checks.
 
 Built on v3.0.0 — Whale + Dev Surveillance Service.
 Uses Solana JSON-RPC via Helius, Jupiter Swap API for auto-sell.
@@ -109,9 +110,25 @@ KNOWN_EXCHANGE_ADDRESSES = {
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 SOL_MINT = "So11111111111111111111111111111111111111112"
-AUTO_SELL_DEFAULT_SLIPPAGE_BPS = 500   # 5% slippage for emergency sells
 AUTO_SELL_SEVERITY_THRESHOLD = "HIGH"  # Minimum severity to trigger auto-sell
 SEVERITY_ORDER = {"NONE": 0, "LOW": 1, "MODERATE": 2, "HIGH": 3, "EXTREME": 4}
+
+# ---------------------------------------------------------------------------
+# Priority Fee Profiles (v4.1) — "Bribe" tactic for rug survival
+# ---------------------------------------------------------------------------
+# NORMAL profile: standard priority, reasonable slippage
+NORMAL_SLIPPAGE_BPS = 500              # 5%
+NORMAL_CU_PRICE_MICRO_LAMPORTS = 0     # let Jupiter auto-optimize
+
+# EMERGENCY profile: maximum priority, wide slippage, aggressive retries
+EMERGENCY_SLIPPAGE_BPS = 1200          # 12% panic slippage
+EMERGENCY_CU_PRICE_MICRO_LAMPORTS = 200_000  # high bribe per CU
+EMERGENCY_MAX_RETRIES = 3
+EMERGENCY_RETRY_DELAYS = [0.2, 0.5, 1.0]  # exponential backoff seconds
+
+# Idempotency: track executed emergency sells to prevent duplicates
+_emergency_event_ids = set()
+_emergency_event_ids_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Liquidity Pool Analysis Configuration (v4.0)
@@ -1029,8 +1046,10 @@ def _jupiter_get_quote(input_mint, output_mint, amount_raw, slippage_bps, jupite
         return None, f"Quote request failed: {str(e)[:200]}"
 
 
-def _jupiter_get_swap_tx(quote_response, user_public_key, jupiter_api_key=None):
-    """Get serialized swap transaction from Jupiter."""
+def _jupiter_get_swap_tx(quote_response, user_public_key, jupiter_api_key=None,
+                         emergency=False):
+    """Get serialized swap transaction from Jupiter.
+    emergency=True adds high priority fee (ComputeUnitPrice bribe)."""
     payload = {
         "userPublicKey": user_public_key,
         "quoteResponse": quote_response,
@@ -1039,6 +1058,14 @@ def _jupiter_get_swap_tx(quote_response, user_public_key, jupiter_api_key=None):
         "dynamicComputeUnitLimit": True,
         "skipUserAccountsRpcCalls": False,
     }
+    # v4.1: Priority fee bribe — validators prioritize higher CU price
+    if emergency and EMERGENCY_CU_PRICE_MICRO_LAMPORTS > 0:
+        payload["computeUnitPriceMicroLamports"] = EMERGENCY_CU_PRICE_MICRO_LAMPORTS
+    elif NORMAL_CU_PRICE_MICRO_LAMPORTS > 0:
+        payload["computeUnitPriceMicroLamports"] = NORMAL_CU_PRICE_MICRO_LAMPORTS
+    else:
+        payload["prioritizationFeeLamports"] = "auto"
+
     headers = {"Content-Type": "application/json"}
     if jupiter_api_key:
         headers["x-api-key"] = jupiter_api_key
@@ -1052,8 +1079,9 @@ def _jupiter_get_swap_tx(quote_response, user_public_key, jupiter_api_key=None):
         return None, f"Swap request failed: {str(e)[:200]}"
 
 
-def _sign_and_send_tx(swap_response, keypair):
-    """Sign Jupiter swap transaction and send to Solana RPC."""
+def _sign_and_send_tx(swap_response, keypair, emergency=False):
+    """Sign Jupiter swap transaction and send to Solana RPC.
+    emergency=True uses skipPreflight for faster inclusion."""
     if not SOLDERS_AVAILABLE:
         return None, "solders library not installed — cannot sign transactions"
     try:
@@ -1063,11 +1091,15 @@ def _sign_and_send_tx(swap_response, keypair):
         raw_tx = bytes(signed_tx)
         tx_b64 = base64.b64encode(raw_tx).decode("ascii")
 
-        result = _rpc_call("sendTransaction", [
-            tx_b64,
-            {"encoding": "base64", "skipPreflight": False,
-             "preflightCommitment": "confirmed"}
-        ], timeout=30)
+        # v4.1: Emergency mode = skipPreflight for speed
+        # In a rug everyone sells at once; skip preflight to submit faster
+        send_opts = {
+            "encoding": "base64",
+            "skipPreflight": emergency,  # True in emergency for speed
+            "preflightCommitment": "confirmed",
+        }
+
+        result = _rpc_call("sendTransaction", [tx_b64, send_opts], timeout=30)
 
         if "error" in result:
             return None, f"sendTransaction: {result.get('detail', result.get('error'))}"
@@ -1077,14 +1109,102 @@ def _sign_and_send_tx(swap_response, keypair):
         return None, f"Sign/send failed: {str(e)[:300]}"
 
 
-def _auto_sell_position(mint, wallet_private_key_b58, jupiter_api_key,
-                        slippage_bps=AUTO_SELL_DEFAULT_SLIPPAGE_BPS):
+def _emergency_sell_with_retries(mint, keypair, public_key, balance,
+                                 jupiter_api_key, slippage_bps, event_id=None):
     """
-    Emergency sell: dump ALL tokens of a mint back to SOL via Jupiter.
+    Emergency sell with priority fees + aggressive retries.
+    Each retry gets a fresh quote (= fresh blockhash) to avoid expiry.
+    Returns result dict.
+    """
+    # v4.1: Idempotency — prevent duplicate emergency sells
+    if event_id:
+        with _emergency_event_ids_lock:
+            if event_id in _emergency_event_ids:
+                return {"success": False, "error": f"Duplicate event_id: {event_id}",
+                        "idempotent_reject": True}
+            _emergency_event_ids.add(event_id)
+
+    last_error = None
+
+    for attempt in range(EMERGENCY_MAX_RETRIES):
+        try:
+            print(f"[EMERGENCY-SELL] Attempt {attempt + 1}/{EMERGENCY_MAX_RETRIES} "
+                  f"for {mint[:12]}... (CU price: {EMERGENCY_CU_PRICE_MICRO_LAMPORTS} "
+                  f"micro-lamports, slippage: {slippage_bps}bps)")
+
+            # Fresh quote each retry = fresh blockhash
+            quote, err = _jupiter_get_quote(mint, SOL_MINT, balance, slippage_bps,
+                                            jupiter_api_key)
+            if err:
+                last_error = f"Quote attempt {attempt + 1}: {err}"
+                if attempt < EMERGENCY_MAX_RETRIES - 1:
+                    time.sleep(EMERGENCY_RETRY_DELAYS[attempt])
+                continue
+
+            # Get swap tx with EMERGENCY priority fee bribe
+            swap_resp, err = _jupiter_get_swap_tx(quote, public_key,
+                                                  jupiter_api_key, emergency=True)
+            if err:
+                last_error = f"SwapTx attempt {attempt + 1}: {err}"
+                if attempt < EMERGENCY_MAX_RETRIES - 1:
+                    time.sleep(EMERGENCY_RETRY_DELAYS[attempt])
+                continue
+
+            # Sign and send with skipPreflight=True for speed
+            signature, err = _sign_and_send_tx(swap_resp, keypair, emergency=True)
+            if err:
+                last_error = f"Send attempt {attempt + 1}: {err}"
+                if attempt < EMERGENCY_MAX_RETRIES - 1:
+                    time.sleep(EMERGENCY_RETRY_DELAYS[attempt])
+                continue
+
+            # SUCCESS
+            print(f"[EMERGENCY-SELL] SUCCESS on attempt {attempt + 1} — "
+                  f"{mint[:12]}... sig: {signature}")
+            return {
+                "success": True,
+                "signature": signature,
+                "tokens_sold": balance,
+                "input_mint": mint,
+                "output_mint": SOL_MINT,
+                "slippage_bps": slippage_bps,
+                "out_amount": quote.get("outAmount", "0"),
+                "price_impact": quote.get("priceImpactPct", "0"),
+                "priority": "EMERGENCY",
+                "cu_price_micro_lamports": EMERGENCY_CU_PRICE_MICRO_LAMPORTS,
+                "attempts": attempt + 1,
+                "event_id": event_id,
+            }
+
+        except Exception as e:
+            last_error = f"Exception attempt {attempt + 1}: {str(e)[:200]}"
+            if attempt < EMERGENCY_MAX_RETRIES - 1:
+                time.sleep(EMERGENCY_RETRY_DELAYS[attempt])
+
+    return {
+        "success": False,
+        "error": f"All {EMERGENCY_MAX_RETRIES} attempts failed. Last: {last_error}",
+        "priority": "EMERGENCY",
+        "attempts": EMERGENCY_MAX_RETRIES,
+        "event_id": event_id,
+    }
+
+
+def _auto_sell_position(mint, wallet_private_key_b58, jupiter_api_key,
+                        slippage_bps=None, priority="EMERGENCY", event_id=None):
+    """
+    Sell ALL tokens of a mint back to SOL via Jupiter.
+    priority="EMERGENCY" → high CU price bribe + wide slippage + retries + skipPreflight
+    priority="NORMAL"    → standard fees + normal slippage + single attempt
     Called directly from the surveillance loop — zero agent latency.
     """
     if not SOLDERS_AVAILABLE:
         return {"success": False, "error": "solders not installed"}
+
+    is_emergency = (priority == "EMERGENCY")
+    if slippage_bps is None:
+        slippage_bps = EMERGENCY_SLIPPAGE_BPS if is_emergency else NORMAL_SLIPPAGE_BPS
+
     try:
         keypair = SoldersKeypair.from_base58_string(wallet_private_key_b58)
         public_key = str(keypair.pubkey())
@@ -1094,23 +1214,30 @@ def _auto_sell_position(mint, wallet_private_key_b58, jupiter_api_key,
         if balance <= 0:
             return {"success": False, "error": "No token balance to sell", "balance": 0}
 
-        print(f"[AUTO-SELL] Selling {balance} raw tokens of {mint[:12]}...")
+        tag = "EMERGENCY-SELL" if is_emergency else "AUTO-SELL"
+        print(f"[{tag}] Selling {balance} raw tokens of {mint[:12]}... "
+              f"priority={priority} slippage={slippage_bps}bps")
 
-        # Step 1: Jupiter quote (token → SOL)
+        # ---- EMERGENCY MODE: retries + priority fee bribe ----
+        if is_emergency:
+            return _emergency_sell_with_retries(
+                mint, keypair, public_key, balance,
+                jupiter_api_key, slippage_bps, event_id)
+
+        # ---- NORMAL MODE: single attempt, standard fees ----
         quote, err = _jupiter_get_quote(mint, SOL_MINT, balance, slippage_bps,
                                         jupiter_api_key)
         if err:
-            return {"success": False, "error": f"Quote: {err}"}
+            return {"success": False, "error": f"Quote: {err}", "priority": "NORMAL"}
 
-        # Step 2: Get swap transaction
-        swap_resp, err = _jupiter_get_swap_tx(quote, public_key, jupiter_api_key)
+        swap_resp, err = _jupiter_get_swap_tx(quote, public_key,
+                                              jupiter_api_key, emergency=False)
         if err:
-            return {"success": False, "error": f"SwapTx: {err}"}
+            return {"success": False, "error": f"SwapTx: {err}", "priority": "NORMAL"}
 
-        # Step 3: Sign and send
-        signature, err = _sign_and_send_tx(swap_resp, keypair)
+        signature, err = _sign_and_send_tx(swap_resp, keypair, emergency=False)
         if err:
-            return {"success": False, "error": f"Send: {err}"}
+            return {"success": False, "error": f"Send: {err}", "priority": "NORMAL"}
 
         print(f"[AUTO-SELL] SUCCESS — {mint[:12]}... sold, sig: {signature}")
         return {
@@ -1122,6 +1249,9 @@ def _auto_sell_position(mint, wallet_private_key_b58, jupiter_api_key,
             "slippage_bps": slippage_bps,
             "out_amount": quote.get("outAmount", "0"),
             "price_impact": quote.get("priceImpactPct", "0"),
+            "priority": "NORMAL",
+            "attempts": 1,
+            "event_id": event_id,
         }
     except Exception as e:
         return {"success": False, "error": f"Exception: {str(e)[:300]}"}
@@ -1486,19 +1616,26 @@ def _poll_single_mint(mint):
             for a in new_alerts:
                 _global_alerts.append(a)
 
-    # ---- v4.0: AUTO-SELL CHECK ----
+    # ---- v4.1: AUTO-SELL CHECK (EMERGENCY PRIORITY) ----
     if (entry.get("auto_sell") and not already_sold and SOLDERS_AVAILABLE):
         threshold = entry.get("auto_sell_severity", AUTO_SELL_SEVERITY_THRESHOLD)
         threshold_val = SEVERITY_ORDER.get(threshold, 3)
         current_val = SEVERITY_ORDER.get(current_severity, 0)
 
         if current_val >= threshold_val:
-            print(f"[AUTO-SELL] TRIGGERED for {mint[:12]}... severity={current_severity}")
+            # Surveillance-triggered sells ALWAYS use EMERGENCY priority
+            # High CU price bribe + wide slippage + aggressive retries
+            print(f"[EMERGENCY-SELL] TRIGGERED for {mint[:12]}... "
+                  f"severity={current_severity} — using priority fees")
             wallet_key = entry.get("wallet_private_key", "")
             jupiter_key = entry.get("jupiter_api_key", "")
-            slippage = entry.get("auto_sell_slippage_bps", AUTO_SELL_DEFAULT_SLIPPAGE_BPS)
+            event_id = f"auto_{mint[:16]}_{int(time.time())}"
 
-            sell_result = _auto_sell_position(mint, wallet_key, jupiter_key, slippage)
+            sell_result = _auto_sell_position(
+                mint, wallet_key, jupiter_key,
+                slippage_bps=EMERGENCY_SLIPPAGE_BPS,
+                priority="EMERGENCY",
+                event_id=event_id)
 
             # Record the sell result
             sell_alert = _create_alert(mint, "AUTO_SELL", current_severity,
@@ -1868,7 +2005,7 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "decision": decision,
         "triggered_signals": triggered_signals,
         "timestamp": timestamp,
-        "version": "4.0.0",
+        "version": "4.1.0",
     }
 
     _cache_set(_snapshot_cache, mint, {
@@ -1898,7 +2035,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
                       "dev_holdings", "tx_pattern_analysis",
                       "holder_concentration", "token_age", "dev_dump_penalty",
@@ -2226,13 +2363,14 @@ def unwatch_endpoint():
 
 
 # ---------------------------------------------------------------------------
-# Manual Emergency Sell (v4.0)
+# Manual Sell + Emergency Exit (v4.1)
 # ---------------------------------------------------------------------------
 @app.route("/sell", methods=["POST"])
 def sell_endpoint():
     """
-    Manual emergency sell: dump all tokens of a mint back to SOL via Jupiter.
-    Reads wallet key from X-Wallet-Private-Key header (OnDemand tool config).
+    Sell tokens back to SOL via Jupiter.
+    priority="EMERGENCY" → high CU bribe + wide slippage + retries + skipPreflight
+    priority="NORMAL"    → standard fees + normal slippage + single attempt
     """
     if not SOLDERS_AVAILABLE:
         return jsonify({"error": "solders library not installed — sell unavailable"}), 500
@@ -2245,7 +2383,9 @@ def sell_endpoint():
     if not mint or not isinstance(mint, str) or len(mint) < 32:
         return jsonify({"error": "Missing or invalid 'mint'"}), 400
 
-    slippage_bps = data.get("slippage_bps", AUTO_SELL_DEFAULT_SLIPPAGE_BPS)
+    priority = data.get("priority", "EMERGENCY").upper()
+    slippage_bps = data.get("slippage_bps")  # None = use profile default
+    event_id = data.get("event_id")
 
     # Read keys from headers
     wallet_key = request.headers.get("X-Wallet-Private-Key", "")
@@ -2255,7 +2395,12 @@ def sell_endpoint():
         return jsonify({"error": "X-Wallet-Private-Key header required"}), 400
 
     try:
-        result = _auto_sell_position(mint, wallet_key, jupiter_key, slippage_bps)
+        result = _auto_sell_position(
+            mint, wallet_key, jupiter_key,
+            slippage_bps=slippage_bps,
+            priority=priority,
+            event_id=event_id,
+        )
         status_code = 200 if result.get("success") else 500
         result["mint"] = mint
         result["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -2309,7 +2454,7 @@ def root():
     return jsonify({
         "service": "Rapid Rug Filter",
         "description": "Solana meme coin rug risk scanner with auto-sell guardian + LP analysis",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "endpoints": {
             "GET /health": "Health check with surveillance status",
             "POST /analyze": "Analyze token mint for rug risk (includes LP check)",
@@ -2335,7 +2480,9 @@ def root():
         },
         "sell_body": {
             "mint": "(required) Token mint address to sell",
-            "slippage_bps": "(optional) Slippage in basis points, default 500",
+            "priority": "(optional) EMERGENCY or NORMAL — default EMERGENCY",
+            "slippage_bps": "(optional) Override slippage, default 1200 emergency / 500 normal",
+            "event_id": "(optional) Idempotency key — prevents duplicate sells",
         },
         "lp_body": {
             "mint": "(required) Token mint address to check LP for",

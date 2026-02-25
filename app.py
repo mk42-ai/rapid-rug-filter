@@ -2,15 +2,13 @@
 Rapid Rug Filter - Solana Meme Coin Structural Rug Risk Scanner
 Production-grade REST API microservice for OnDemand agent tool calling.
 
-v4.1.0 — Auto-Sell Guardian + Priority Fee Bribe + LP Analysis.
-Jupiter-powered emergency auto-sell with priority fee bribes.
-Validators prioritize our sell tx via high ComputeUnitPrice when everyone
-is panic-selling during a rug — our tx gets included while liquidity exists.
-Emergency profile: high CU price + wide slippage + 3 retries + skipPreflight.
-LP lock/burn verification for pre-entry liquidity checks.
+v5.0.0 — Portfolio Auto-Pilot + Continuous Wallet Monitoring.
+Zero-agent post-buy protection: auto-detects new token purchases in wallet,
+runs analyze → watch → surveillance → auto-sell pipeline automatically.
+Portfolio scanner thread monitors wallet holdings every 10s as source of truth.
 
-Built on v3.0.0 — Whale + Dev Surveillance Service.
-Uses Solana JSON-RPC via Helius, Jupiter Swap API for auto-sell.
+Built on v4.1.0 — Auto-Sell Guardian + Priority Fee Bribe + LP Analysis.
+Uses Solana JSON-RPC via Helius (Business), Jupiter Swap API for auto-sell.
 No RapidAPI dependency — calls Solana chain nodes directly for speed.
 """
 
@@ -70,7 +68,7 @@ SYSTEM_ADDRESSES = {
 # Surveillance Configuration (v3.0)
 # ---------------------------------------------------------------------------
 MONITOR_DEFAULT_INTERVAL = 10    # seconds between polls per mint
-MONITOR_MAX_MINTS = 10           # max concurrent watches
+MONITOR_MAX_MINTS = 25           # max concurrent watches (Helius Business tier)
 MONITOR_HISTORY_MAXLEN = 60      # rolling snapshot history (~10 min at 10s)
 
 # Dev dump thresholds
@@ -142,6 +140,21 @@ LP_BURN_ADDRESSES = {
 }
 
 # ---------------------------------------------------------------------------
+# Portfolio Auto-Pilot Configuration (v5.0)
+# ---------------------------------------------------------------------------
+PORTFOLIO_SCAN_INTERVAL = 10         # seconds between wallet scans
+PORTFOLIO_WATCH_STAGGER_DELAY = 1.0  # seconds between auto-watch setups
+PORTFOLIO_EVENTS_MAXLEN = 500        # max events in portfolio event log
+PORTFOLIO_MAX_HOLDINGS = 30          # max tokens to track simultaneously
+
+# Tokens to NEVER watch (stablecoins, wrapped SOL)
+PORTFOLIO_IGNORE_MINTS = {
+    "So11111111111111111111111111111111111111112",     # Wrapped SOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+}
+
+# ---------------------------------------------------------------------------
 # Surveillance Global State (v3.0)
 # ---------------------------------------------------------------------------
 _watched_mints = {}            # mint -> entry dict
@@ -150,6 +163,14 @@ _global_alerts = deque(maxlen=200)
 _global_alerts_lock = threading.Lock()
 _monitor_thread = None
 _monitor_stop_event = threading.Event()
+
+# ---------------------------------------------------------------------------
+# Portfolio Auto-Pilot Global State (v5.0)
+# ---------------------------------------------------------------------------
+_portfolio_state = {}               # single portfolio state dict (empty = inactive)
+_portfolio_state_lock = threading.Lock()
+_portfolio_thread = None
+_portfolio_stop_event = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +246,14 @@ def fetch_account_info(pubkey):
     return data
 
 
-def fetch_token_accounts_by_owner(owner, mint=None):
-    """getTokenAccountsByOwner with optional mint filter."""
+def fetch_token_accounts_by_owner(owner, mint=None, bypass_cache=False):
+    """getTokenAccountsByOwner with optional mint filter.
+    bypass_cache=True skips cache lookup (used by portfolio scanner for fresh data)."""
     cache_key = f"tao:{owner}:{mint or 'all'}"
-    cached = _cache_get(_account_cache, cache_key, CACHE_TTL_SECONDS)
-    if cached is not None:
-        return cached
+    if not bypass_cache:
+        cached = _cache_get(_account_cache, cache_key, CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
     filter_obj = {"programId": TOKEN_PROGRAM_ID}
     if mint:
         filter_obj = {"mint": mint}
@@ -761,6 +784,40 @@ def parse_token_accounts_for_mint(raw, target_mint):
     except Exception:
         pass
     return accounts
+
+
+def _parse_all_token_accounts(raw):
+    """
+    Parse getTokenAccountsByOwner response for ALL mints (v5.0 Portfolio).
+    Returns dict: mint -> {amount: int, decimals: int, ui_amount: float}
+    Filters out zero-balance and PORTFOLIO_IGNORE_MINTS.
+    """
+    result = {}
+    if not raw or "error" in raw:
+        return result
+    try:
+        value_list = raw.get("result", {}).get("value", [])
+        for item in value_list:
+            acct = item.get("account", {})
+            data = acct.get("data", {})
+            if isinstance(data, dict) and "parsed" in data:
+                info = data["parsed"].get("info", {})
+                mint = info.get("mint", "")
+                ta = info.get("tokenAmount", {})
+                amount = int(ta.get("amount", "0"))
+                # Skip zero balance and ignored mints
+                if amount <= 0:
+                    continue
+                if mint in PORTFOLIO_IGNORE_MINTS:
+                    continue
+                result[mint] = {
+                    "amount": amount,
+                    "decimals": ta.get("decimals", 0),
+                    "ui_amount": ta.get("uiAmount", 0) or 0,
+                }
+    except Exception:
+        pass
+    return result
 
 
 def analyze_transactions(dev_wallet, target_mint, signatures_raw=None, provided_sigs=None):
@@ -1557,6 +1614,149 @@ def _evaluate_triggers(entry, current_snap, dev_fanout_dests, whale_fanout_resul
 
 
 # ---------------------------------------------------------------------------
+# Portfolio Auto-Pilot Helpers (v5.0)
+# ---------------------------------------------------------------------------
+def _portfolio_add_event(event_type, mint, message, details=None):
+    """Append an event to the portfolio event log. Thread-safe."""
+    event = {
+        "type": event_type,
+        "mint": mint,
+        "message": message,
+        "details": details or {},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    with _portfolio_state_lock:
+        if _portfolio_state and "events" in _portfolio_state:
+            _portfolio_state["events"].append(event)
+    print(f"[PORTFOLIO] {event_type}: {message}")
+    return event
+
+
+def _portfolio_run_analysis(mint):
+    """
+    Run analyze() internally for a portfolio-detected token.
+    Returns compact summary dict or None on failure.
+    """
+    try:
+        result = analyze(mint)
+        return {
+            "risk_score": result.get("risk_score"),
+            "risk_level": result.get("risk_level"),
+            "decision": result.get("decision"),
+            "token_age_hours": result.get("token_age_hours"),
+            "top1_pct": result.get("holder_concentration", {}).get("top1_pct"),
+            "has_liquidity": result.get("liquidity_pool", {}).get("has_liquidity")
+                if result.get("liquidity_pool") else None,
+            "timestamp": result.get("timestamp"),
+        }
+    except Exception as e:
+        return {"error": str(e)[:200], "risk_score": None, "risk_level": "UNKNOWN"}
+
+
+def _portfolio_auto_watch(mint, wallet_private_key, jupiter_api_key):
+    """
+    Internal auto-watch for a portfolio-detected token (v5.0).
+    Replicates /watch endpoint logic but runs without HTTP context.
+    Always enables auto_sell=True with EMERGENCY priority.
+    Returns True on success, False on failure.
+    """
+    try:
+        # Check if already watching
+        with _watched_mints_lock:
+            if mint in _watched_mints:
+                _portfolio_add_event("ALREADY_WATCHING", mint,
+                    f"Token {mint[:12]}... already in surveillance")
+                return True
+            if len(_watched_mints) >= MONITOR_MAX_MINTS:
+                _portfolio_add_event("WATCH_CAPACITY_FULL", mint,
+                    f"Cannot watch {mint[:12]}... — at max capacity ({MONITOR_MAX_MINTS})")
+                return False
+
+        # Fetch mint info (reuse existing function)
+        raw_mint = fetch_account_info(mint)
+        mint_info = parse_mint_info(raw_mint)
+        supply = mint_info.get("supply")
+        decimals = mint_info.get("decimals")
+
+        if not supply:
+            _portfolio_add_event("WATCH_FAILED", mint,
+                f"Could not fetch mint info for {mint[:12]}...")
+            return False
+
+        # Detect dev wallet (reuse existing function)
+        dev_detection = detect_dev_wallet(mint, mint_info)
+        dev_wallet = dev_detection.get("probable_dev_wallet")
+        dev_confidence = dev_detection.get("confidence", "none")
+
+        # Resolve whale wallets (reuse existing function)
+        holders_raw = fetch_token_largest_accounts(mint)
+        whale_owners = _resolve_whale_owners(mint, holders_raw, top_n=10)
+        whale_wallets = [w for w, _ in whale_owners]
+
+        # Take entry snapshot (reuse existing function)
+        entry_snapshot = _take_snapshot(mint, dev_wallet, whale_wallets, supply)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Build entry dict — identical structure to /watch endpoint
+        entry = {
+            "mint": mint,
+            "entry_timestamp": now_iso,
+            "dev_wallet": dev_wallet,
+            "dev_confidence": dev_confidence,
+            "whale_wallets": whale_wallets,
+            "supply": supply,
+            "decimals": decimals,
+            "entry_snapshot": entry_snapshot,
+            "current_snapshot": entry_snapshot,
+            "history": deque(maxlen=MONITOR_HISTORY_MAXLEN),
+            "flags": {
+                "dev_dump_flag": False,
+                "dev_severe_dump_flag": False,
+                "dev_distribution_flag": False,
+                "whale_dump_flag": False,
+                "whale_distribution_flag": False,
+                "top_holder_exit_flag": False,
+            },
+            "alerts": [],
+            "severity": "NONE",
+            "last_checked": time.time(),
+            "poll_interval": MONITOR_DEFAULT_INTERVAL,
+            # Auto-sell always enabled for portfolio-detected tokens
+            "auto_sell": True,
+            "auto_sell_slippage_bps": EMERGENCY_SLIPPAGE_BPS,
+            "auto_sell_severity": AUTO_SELL_SEVERITY_THRESHOLD,
+            "auto_sell_executed": False,
+            "auto_sell_result": None,
+            "wallet_private_key": wallet_private_key,
+            "jupiter_api_key": jupiter_api_key,
+            # v5.0: Mark this was auto-detected by portfolio monitor
+            "source": "portfolio_auto_detect",
+        }
+        entry["history"].append((entry_snapshot["timestamp"], entry_snapshot))
+
+        with _watched_mints_lock:
+            _watched_mints[mint] = entry
+
+        # Start surveillance monitor if not running
+        _start_monitor_thread()
+
+        _portfolio_add_event("WATCH_STARTED", mint,
+            f"Auto-watch started for {mint[:12]}... "
+            f"dev={'%s...' % dev_wallet[:12] if dev_wallet else 'unknown'} "
+            f"whales={len(whale_wallets)} supply={supply}",
+            {"dev_wallet": dev_wallet, "dev_confidence": dev_confidence,
+             "whale_count": len(whale_wallets), "supply": supply})
+
+        return True
+
+    except Exception as e:
+        _portfolio_add_event("WATCH_ERROR", mint,
+            f"Failed to auto-watch {mint[:12]}...: {str(e)[:200]}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Monitor Loop (v3.0)
 # ---------------------------------------------------------------------------
 def _poll_single_mint(mint):
@@ -1699,6 +1899,192 @@ def _stop_monitor_thread():
     if _monitor_thread:
         _monitor_thread.join(timeout=5)
         _monitor_thread = None
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Auto-Pilot Scanner (v5.0)
+# ---------------------------------------------------------------------------
+def _portfolio_scan_loop():
+    """
+    Portfolio Auto-Pilot daemon thread.
+    Scans wallet holdings every PORTFOLIO_SCAN_INTERVAL seconds.
+    Detects new tokens and removed tokens, auto-watches new ones.
+    """
+    while not _portfolio_stop_event.is_set():
+        try:
+            with _portfolio_state_lock:
+                if not _portfolio_state or not _portfolio_state.get("active"):
+                    break
+                wallet_address = _portfolio_state["wallet_address"]
+                wallet_private_key = _portfolio_state["wallet_private_key"]
+                jupiter_api_key = _portfolio_state["jupiter_api_key"]
+                known_holdings = {
+                    m: dict(h) for m, h in _portfolio_state.get("holdings", {}).items()
+                }
+
+            # --- STEP 1: Fetch ALL token accounts (single RPC call, bypass cache) ---
+            raw = fetch_token_accounts_by_owner(wallet_address, mint=None, bypass_cache=True)
+            if not raw or "error" in raw:
+                print(f"[PORTFOLIO] Scan error: RPC returned error or empty")
+                with _portfolio_state_lock:
+                    if _portfolio_state:
+                        _portfolio_state["scan_errors"] = _portfolio_state.get("scan_errors", 0) + 1
+                _portfolio_stop_event.wait(PORTFOLIO_SCAN_INTERVAL)
+                continue
+
+            current_tokens = _parse_all_token_accounts(raw)
+
+            # --- STEP 2: Detect NEW tokens ---
+            new_mints = []
+            for mint, token_data in current_tokens.items():
+                if mint not in known_holdings or known_holdings[mint].get("watch_status") == "removed":
+                    new_mints.append((mint, token_data))
+
+            # --- STEP 3: Detect REMOVED tokens (balance -> 0 or gone from wallet) ---
+            removed_mints = []
+            for mint, holding in known_holdings.items():
+                if holding.get("watch_status") in ("removed", "sold"):
+                    continue  # already handled
+                if mint not in current_tokens:
+                    removed_mints.append(mint)
+
+            # --- STEP 4: Handle NEW tokens (staggered to avoid RPC spike) ---
+            for mint, token_data in new_mints:
+                if _portfolio_stop_event.is_set():
+                    break
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                _portfolio_add_event("NEW_TOKEN_DETECTED", mint,
+                    f"New token detected: {mint[:12]}... amount={token_data['ui_amount']}",
+                    {"amount": token_data["amount"], "ui_amount": token_data["ui_amount"],
+                     "decimals": token_data["decimals"]})
+
+                # Update holding in state as "pending"
+                with _portfolio_state_lock:
+                    if _portfolio_state:
+                        _portfolio_state["holdings"][mint] = {
+                            "amount": token_data["amount"],
+                            "decimals": token_data["decimals"],
+                            "ui_amount": token_data["ui_amount"],
+                            "first_seen": now_iso,
+                            "last_seen": now_iso,
+                            "watch_status": "pending",
+                            "analysis_summary": None,
+                            "auto_sell_executed": False,
+                            "auto_sell_result": None,
+                        }
+
+                # Run analysis for record-keeping
+                analysis = _portfolio_run_analysis(mint)
+                with _portfolio_state_lock:
+                    if _portfolio_state and mint in _portfolio_state.get("holdings", {}):
+                        _portfolio_state["holdings"][mint]["analysis_summary"] = analysis
+
+                _portfolio_add_event("ANALYSIS_COMPLETE", mint,
+                    f"Analysis for {mint[:12]}...: score={analysis.get('risk_score')} "
+                    f"level={analysis.get('risk_level')} decision={analysis.get('decision')}",
+                    analysis)
+
+                # Auto-watch with surveillance + auto-sell
+                success = _portfolio_auto_watch(mint, wallet_private_key, jupiter_api_key)
+                with _portfolio_state_lock:
+                    if _portfolio_state and mint in _portfolio_state.get("holdings", {}):
+                        _portfolio_state["holdings"][mint]["watch_status"] = (
+                            "watching" if success else "failed"
+                        )
+
+                # Stagger to avoid RPC spike when multiple tokens detected
+                if len(new_mints) > 1:
+                    time.sleep(PORTFOLIO_WATCH_STAGGER_DELAY)
+
+            # --- STEP 5: Handle REMOVED tokens (balance → 0) ---
+            for mint in removed_mints:
+                _portfolio_add_event("TOKEN_REMOVED", mint,
+                    f"Token {mint[:12]}... no longer in wallet (balance=0)")
+
+                # Auto-unwatch from surveillance
+                with _watched_mints_lock:
+                    if mint in _watched_mints:
+                        removed_entry = _watched_mints.pop(mint)
+                        remaining = len(_watched_mints)
+                        _portfolio_add_event("AUTO_UNWATCHED", mint,
+                            f"Auto-unwatched {mint[:12]}... (removed from wallet)",
+                            {"final_severity": removed_entry.get("severity", "NONE"),
+                             "alerts_count": len(removed_entry.get("alerts", []))})
+
+                # Check if we should stop surveillance monitor
+                with _watched_mints_lock:
+                    if len(_watched_mints) == 0:
+                        _stop_monitor_thread()
+
+                with _portfolio_state_lock:
+                    if _portfolio_state and mint in _portfolio_state.get("holdings", {}):
+                        _portfolio_state["holdings"][mint]["watch_status"] = "removed"
+
+            # --- STEP 6: Update existing holdings balances + sync sell status ---
+            # First: collect sell status from surveillance (avoid nested locks)
+            sell_status = {}
+            with _watched_mints_lock:
+                for mint in current_tokens:
+                    if mint in _watched_mints:
+                        wm = _watched_mints[mint]
+                        if wm.get("auto_sell_executed"):
+                            sell_status[mint] = {
+                                "executed": True,
+                                "result": copy.deepcopy(wm.get("auto_sell_result")),
+                            }
+
+            # Then: update portfolio state
+            new_mint_set = {m for m, _ in new_mints}
+            with _portfolio_state_lock:
+                if _portfolio_state:
+                    for mint, token_data in current_tokens.items():
+                        if mint in new_mint_set:
+                            continue  # Already handled in step 4
+                        if mint in _portfolio_state.get("holdings", {}):
+                            h = _portfolio_state["holdings"][mint]
+                            h["amount"] = token_data["amount"]
+                            h["decimals"] = token_data["decimals"]
+                            h["ui_amount"] = token_data["ui_amount"]
+                            h["last_seen"] = datetime.now(timezone.utc).isoformat()
+                            if mint in sell_status:
+                                h["auto_sell_executed"] = True
+                                h["auto_sell_result"] = sell_status[mint]["result"]
+                                h["watch_status"] = "sold"
+
+            # --- STEP 7: Update scan metadata ---
+            with _portfolio_state_lock:
+                if _portfolio_state:
+                    _portfolio_state["last_scan"] = time.time()
+                    _portfolio_state["scan_count"] = _portfolio_state.get("scan_count", 0) + 1
+
+        except Exception as e:
+            print(f"[PORTFOLIO] Scan loop error: {e}")
+            with _portfolio_state_lock:
+                if _portfolio_state:
+                    _portfolio_state["scan_errors"] = _portfolio_state.get("scan_errors", 0) + 1
+
+        _portfolio_stop_event.wait(PORTFOLIO_SCAN_INTERVAL)
+
+
+def _start_portfolio_thread():
+    """Lazy-start the portfolio scanner daemon thread."""
+    global _portfolio_thread
+    if _portfolio_thread and _portfolio_thread.is_alive():
+        return
+    _portfolio_stop_event.clear()
+    _portfolio_thread = threading.Thread(
+        target=_portfolio_scan_loop, daemon=True, name="portfolio-monitor")
+    _portfolio_thread.start()
+
+
+def _stop_portfolio_thread():
+    """Stop the portfolio scanner thread."""
+    global _portfolio_thread
+    _portfolio_stop_event.set()
+    if _portfolio_thread:
+        _portfolio_thread.join(timeout=5)
+        _portfolio_thread = None
 
 
 # ---------------------------------------------------------------------------
@@ -2006,7 +2392,7 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "decision": decision,
         "triggered_signals": triggered_signals,
         "timestamp": timestamp,
-        "version": "4.1.0",
+        "version": "5.0.0",
     }
 
     _cache_set(_snapshot_cache, mint, {
@@ -2032,17 +2418,25 @@ def health():
         watched_list = list(_watched_mints.keys())
     with _global_alerts_lock:
         alert_count = len(_global_alerts)
+    with _portfolio_state_lock:
+        portfolio_active = (
+            _portfolio_thread is not None and _portfolio_thread.is_alive()
+        )
+        portfolio_wallet = _portfolio_state.get("wallet_address", "")
+        portfolio_scans = _portfolio_state.get("scan_count", 0)
+        portfolio_holdings = len(_portfolio_state.get("holdings", {}))
 
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "4.1.0",
+        "version": "5.0.0",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
                       "dev_holdings", "tx_pattern_analysis",
                       "holder_concentration", "token_age", "dev_dump_penalty",
                       "strict_thresholds", "whale_surveillance", "dev_dump_monitor",
                       "fanout_detection", "exchange_exit_detection",
-                      "jupiter_auto_sell", "lp_lock_analysis", "manual_sell"],
+                      "jupiter_auto_sell", "lp_lock_analysis", "manual_sell",
+                      "portfolio_autopilot", "auto_watch", "wallet_monitoring"],
         "auto_sell_available": SOLDERS_AVAILABLE,
         "surveillance": {
             "active": _monitor_thread is not None and _monitor_thread.is_alive(),
@@ -2050,6 +2444,12 @@ def health():
             "watched_list": watched_list,
             "total_alerts": alert_count,
             "max_capacity": MONITOR_MAX_MINTS,
+        },
+        "portfolio_autopilot": {
+            "active": portfolio_active,
+            "wallet": (portfolio_wallet[:12] + "...") if portfolio_wallet else None,
+            "scan_count": portfolio_scans,
+            "holdings_count": portfolio_holdings,
         },
         "rpc_endpoint": SOLANA_RPC_URL[:50] + "...",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2450,14 +2850,216 @@ def lp_endpoint():
         }), 500
 
 
+# ---------------------------------------------------------------------------
+# Portfolio Auto-Pilot Routes (v5.0)
+# ---------------------------------------------------------------------------
+@app.route("/portfolio/start", methods=["POST"])
+def portfolio_start_endpoint():
+    """
+    Start Portfolio Auto-Pilot: continuously monitor wallet holdings.
+    Idempotent: if already running for same wallet, returns current state.
+
+    Headers required:
+      X-Wallet-Address: public key of wallet to monitor
+      X-Wallet-Private-Key: private key for auto-sell
+      X-Jupiter-Api-Key: Jupiter API key
+    """
+    wallet_address = request.headers.get("X-Wallet-Address", "").strip()
+    wallet_private_key = request.headers.get("X-Wallet-Private-Key", "").strip()
+    jupiter_api_key = request.headers.get("X-Jupiter-Api-Key", "").strip()
+
+    if not wallet_address or len(wallet_address) < 32:
+        return jsonify({"error": "X-Wallet-Address header required (Solana public key)"}), 400
+
+    if not wallet_private_key:
+        return jsonify({"error": "X-Wallet-Private-Key header required for auto-sell"}), 400
+
+    if not SOLDERS_AVAILABLE:
+        return jsonify({"error": "Portfolio Auto-Pilot requires solders library for auto-sell"}), 500
+
+    # Idempotent: if already running for this wallet, return current state
+    with _portfolio_state_lock:
+        if _portfolio_state and _portfolio_state.get("active"):
+            if _portfolio_state.get("wallet_address") == wallet_address:
+                # Update keys in case they changed
+                _portfolio_state["wallet_private_key"] = wallet_private_key
+                _portfolio_state["jupiter_api_key"] = jupiter_api_key
+                state_copy = copy.deepcopy(_portfolio_state)
+                # Sanitize: remove private keys from response
+                state_copy.pop("wallet_private_key", None)
+                state_copy.pop("jupiter_api_key", None)
+                # Convert events deque to list for JSON
+                state_copy["events"] = list(state_copy.get("events", []))[-20:]
+                return jsonify({
+                    "status": "already_running",
+                    "portfolio": {
+                        "wallet_address": state_copy.get("wallet_address"),
+                        "started_at": state_copy.get("started_at"),
+                        "scan_count": state_copy.get("scan_count", 0),
+                        "holdings_count": len(state_copy.get("holdings", {})),
+                        "recent_events": state_copy["events"],
+                    },
+                }), 200
+
+    # Stop existing portfolio if running for different wallet
+    _stop_portfolio_thread()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with _portfolio_state_lock:
+        _portfolio_state.clear()
+        _portfolio_state.update({
+            "wallet_address": wallet_address,
+            "wallet_private_key": wallet_private_key,
+            "jupiter_api_key": jupiter_api_key,
+            "active": True,
+            "started_at": now_iso,
+            "last_scan": 0.0,
+            "scan_count": 0,
+            "scan_errors": 0,
+            "holdings": {},
+            "events": deque(maxlen=PORTFOLIO_EVENTS_MAXLEN),
+        })
+
+    _portfolio_add_event("PORTFOLIO_STARTED", None,
+        f"Portfolio Auto-Pilot started for wallet {wallet_address[:12]}...")
+
+    _start_portfolio_thread()
+
+    return jsonify({
+        "status": "started",
+        "wallet_address": wallet_address,
+        "started_at": now_iso,
+        "scan_interval": PORTFOLIO_SCAN_INTERVAL,
+        "ignore_mints": list(PORTFOLIO_IGNORE_MINTS),
+        "auto_sell_enabled": True,
+        "auto_sell_priority": "EMERGENCY",
+        "message": "Portfolio Auto-Pilot active. First scan in progress.",
+    }), 201
+
+
+@app.route("/portfolio", methods=["GET"])
+def portfolio_endpoint():
+    """
+    Get current portfolio state: all holdings, watch status, events.
+    This is the source of truth for what the wallet holds.
+    """
+    with _portfolio_state_lock:
+        if not _portfolio_state or not _portfolio_state.get("active"):
+            return jsonify({
+                "status": "inactive",
+                "message": "Portfolio Auto-Pilot is not running. Call POST /portfolio/start first.",
+            }), 404
+        state_copy = copy.deepcopy(_portfolio_state)
+
+    # Sanitize private keys
+    state_copy.pop("wallet_private_key", None)
+    state_copy.pop("jupiter_api_key", None)
+
+    # Convert events deque to list
+    events_list = list(state_copy.get("events", []))
+
+    # Enrich holdings with live surveillance data
+    enriched_holdings = {}
+    with _watched_mints_lock:
+        for mint, holding in state_copy.get("holdings", {}).items():
+            enriched = dict(holding)
+            if mint in _watched_mints:
+                wm = _watched_mints[mint]
+                enriched["severity"] = wm.get("severity", "NONE")
+                enriched["flags"] = wm.get("flags", {})
+                enriched["alerts_count"] = len(wm.get("alerts", []))
+                enriched["recent_alerts"] = [
+                    {"trigger": a.get("trigger"), "severity": a.get("severity"),
+                     "message": a.get("message"), "timestamp": a.get("timestamp")}
+                    for a in wm.get("alerts", [])[-3:]
+                ]
+                enriched["auto_sell_executed"] = wm.get("auto_sell_executed", False)
+                if wm.get("auto_sell_result"):
+                    enriched["auto_sell_result"] = {
+                        "success": wm["auto_sell_result"].get("success"),
+                        "signature": wm["auto_sell_result"].get("signature"),
+                        "tokens_sold": wm["auto_sell_result"].get("tokens_sold"),
+                    }
+            else:
+                enriched.setdefault("severity", "NONE")
+                enriched.setdefault("flags", {})
+                enriched.setdefault("alerts_count", 0)
+                enriched.setdefault("recent_alerts", [])
+            enriched_holdings[mint] = enriched
+
+    # Summary stats
+    total_holdings = len(enriched_holdings)
+    watching_count = sum(
+        1 for h in enriched_holdings.values() if h.get("watch_status") == "watching"
+    )
+    sold_count = sum(
+        1 for h in enriched_holdings.values() if h.get("watch_status") == "sold"
+    )
+    high_severity = sum(
+        1 for h in enriched_holdings.values()
+        if SEVERITY_ORDER.get(h.get("severity", "NONE"), 0) >= SEVERITY_ORDER.get("HIGH", 3)
+    )
+
+    return jsonify({
+        "status": "active",
+        "wallet_address": state_copy.get("wallet_address"),
+        "started_at": state_copy.get("started_at"),
+        "last_scan": (
+            datetime.fromtimestamp(state_copy["last_scan"], tz=timezone.utc).isoformat()
+            if state_copy.get("last_scan") else None
+        ),
+        "scan_count": state_copy.get("scan_count", 0),
+        "scan_errors": state_copy.get("scan_errors", 0),
+        "summary": {
+            "total_holdings": total_holdings,
+            "actively_watching": watching_count,
+            "auto_sold": sold_count,
+            "high_severity_alerts": high_severity,
+        },
+        "holdings": enriched_holdings,
+        "recent_events": events_list[-30:],
+        "version": "5.0.0",
+    })
+
+
+@app.route("/portfolio/stop", methods=["POST"])
+def portfolio_stop_endpoint():
+    """Stop Portfolio Auto-Pilot. Does NOT stop surveillance on already-watched tokens."""
+    with _portfolio_state_lock:
+        if not _portfolio_state or not _portfolio_state.get("active"):
+            return jsonify({"status": "already_stopped"}), 200
+        state_copy = copy.deepcopy(_portfolio_state)
+        _portfolio_state["active"] = False
+
+    _stop_portfolio_thread()
+
+    # Sanitize
+    state_copy.pop("wallet_private_key", None)
+    state_copy.pop("jupiter_api_key", None)
+    events_list = list(state_copy.get("events", []))
+
+    _portfolio_add_event("PORTFOLIO_STOPPED", None, "Portfolio Auto-Pilot stopped by user")
+
+    return jsonify({
+        "status": "stopped",
+        "wallet_address": state_copy.get("wallet_address"),
+        "ran_since": state_copy.get("started_at"),
+        "total_scans": state_copy.get("scan_count", 0),
+        "total_holdings_tracked": len(state_copy.get("holdings", {})),
+        "note": "Surveillance continues on already-watched tokens. Use /unwatch to stop individual watches.",
+        "final_events": events_list[-10:],
+    })
+
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
         "service": "Rapid Rug Filter",
-        "description": "Solana meme coin rug risk scanner with auto-sell guardian + LP analysis",
-        "version": "4.1.0",
+        "description": "Solana meme coin rug risk scanner with portfolio auto-pilot + auto-sell guardian + LP analysis",
+        "version": "5.0.0",
         "endpoints": {
-            "GET /health": "Health check with surveillance status",
+            "GET /health": "Health check with surveillance + portfolio status",
             "POST /analyze": "Analyze token mint for rug risk (includes LP check)",
             "GET /snapshot?mint=...": "Get cached analysis snapshot",
             "POST /watch": "Start surveillance with optional auto-sell protection",
@@ -2466,6 +3068,9 @@ def root():
             "POST /unwatch": "Stop watching a mint after exit",
             "POST /sell": "Manual emergency sell via Jupiter (token → SOL)",
             "POST /lp": "Check liquidity pool lock status for a token",
+            "POST /portfolio/start": "Start Portfolio Auto-Pilot: continuous wallet monitoring + auto-watch",
+            "GET /portfolio": "Get live portfolio: all holdings, watch status, severity, events",
+            "POST /portfolio/stop": "Stop portfolio monitoring (surveillance continues)",
         },
         "analyze_body": {
             "mint": "(required) Solana token mint address",
@@ -2492,8 +3097,9 @@ def root():
             "mint": "(required) Solana token mint address to stop watching",
         },
         "headers": {
-            "X-Wallet-Private-Key": "Solana wallet private key (base58) — for /sell and /watch auto_sell",
-            "X-Jupiter-Api-Key": "Jupiter API key — for /sell, /watch auto_sell, and /lp",
+            "X-Wallet-Address": "Solana wallet public key — for /portfolio/start (wallet to monitor)",
+            "X-Wallet-Private-Key": "Solana wallet private key (base58) — for /sell, /watch, /portfolio auto_sell",
+            "X-Jupiter-Api-Key": "Jupiter API key — for /sell, /watch, /portfolio, and /lp",
         },
     })
 

@@ -2,13 +2,14 @@
 Rapid Rug Filter - Solana Meme Coin Structural Rug Risk Scanner
 Production-grade REST API microservice for OnDemand agent tool calling.
 
-v3.0.0 — Whale + Dev Surveillance Service.
-Adds continuous monitoring after entry: /watch, /status, /alerts, /unwatch.
-Detects dev dumping, whale exits, distribution patterns in real-time.
+v4.0.0 — Auto-Sell Guardian + Liquidity Pool Analysis.
+Adds Jupiter-powered emergency auto-sell directly in the surveillance loop.
+Adds LP lock/burn verification for pre-entry liquidity checks.
+When surveillance detects HIGH/EXTREME severity, the same thread that detects
+the rug also executes the sell via Jupiter — zero agent latency.
 
-Built on v2.1.0 — Helius Developer RPC (10M credits/mo, 50 RPS).
-Robust scoring: holder concentration, token age, dev-dump penalty, strict thresholds.
-Uses Solana JSON-RPC directly via Helius dedicated endpoint.
+Built on v3.0.0 — Whale + Dev Surveillance Service.
+Uses Solana JSON-RPC via Helius, Jupiter Swap API for auto-sell.
 No RapidAPI dependency — calls Solana chain nodes directly for speed.
 """
 
@@ -24,6 +25,14 @@ from collections import deque
 from flask import Flask, request, jsonify
 
 import requests as http_requests
+
+try:
+    from solders.keypair import Keypair as SoldersKeypair
+    from solders.transaction import VersionedTransaction as SoldersVersionedTx
+    SOLDERS_AVAILABLE = True
+except ImportError:
+    SOLDERS_AVAILABLE = False
+    print("[WARN] solders not available — auto-sell disabled")
 
 app = Flask(__name__)
 
@@ -92,6 +101,26 @@ KNOWN_EXCHANGE_ADDRESSES = {
     # Kraken
     "FWznbcNXWQuHTawe9RxvQ2LdCENssh12dsznf4RiouN5",
     "CnXhMid6m8FKM9u7o95qXdZtaXq3yJLcQB3Uq2hTj2sM",
+}
+
+# ---------------------------------------------------------------------------
+# Jupiter Swap Configuration (v4.0)
+# ---------------------------------------------------------------------------
+JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+AUTO_SELL_DEFAULT_SLIPPAGE_BPS = 500   # 5% slippage for emergency sells
+AUTO_SELL_SEVERITY_THRESHOLD = "HIGH"  # Minimum severity to trigger auto-sell
+SEVERITY_ORDER = {"NONE": 0, "LOW": 1, "MODERATE": 2, "HIGH": 3, "EXTREME": 4}
+
+# ---------------------------------------------------------------------------
+# Liquidity Pool Analysis Configuration (v4.0)
+# ---------------------------------------------------------------------------
+RAYDIUM_AMM_V4_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+RAYDIUM_CPMM_PROGRAM = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+LP_BURN_ADDRESSES = {
+    "1nc1nerator11111111111111111111111111111111",  # Solana incinerator
+    "11111111111111111111111111111111",              # System program
 }
 
 # ---------------------------------------------------------------------------
@@ -974,6 +1003,319 @@ def _calc_change_pct(entry_val, current_val):
 
 
 # ---------------------------------------------------------------------------
+# Jupiter Swap Functions (v4.0)
+# ---------------------------------------------------------------------------
+def _jupiter_get_quote(input_mint, output_mint, amount_raw, slippage_bps, jupiter_api_key=None):
+    """Get swap quote from Jupiter Aggregator."""
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount_raw),
+        "slippageBps": str(slippage_bps),
+        "swapMode": "ExactIn",
+        "restrictIntermediateTokens": "true",
+        "maxAccounts": "64",
+    }
+    headers = {}
+    if jupiter_api_key:
+        headers["x-api-key"] = jupiter_api_key
+    try:
+        resp = http_requests.get(JUPITER_QUOTE_URL, params=params,
+                                 headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None, f"Quote API {resp.status_code}: {resp.text[:200]}"
+        return resp.json(), None
+    except Exception as e:
+        return None, f"Quote request failed: {str(e)[:200]}"
+
+
+def _jupiter_get_swap_tx(quote_response, user_public_key, jupiter_api_key=None):
+    """Get serialized swap transaction from Jupiter."""
+    payload = {
+        "userPublicKey": user_public_key,
+        "quoteResponse": quote_response,
+        "wrapAndUnwrapSol": True,
+        "useSharedAccounts": False,
+        "dynamicComputeUnitLimit": True,
+        "skipUserAccountsRpcCalls": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if jupiter_api_key:
+        headers["x-api-key"] = jupiter_api_key
+    try:
+        resp = http_requests.post(JUPITER_SWAP_URL, json=payload,
+                                  headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None, f"Swap API {resp.status_code}: {resp.text[:200]}"
+        return resp.json(), None
+    except Exception as e:
+        return None, f"Swap request failed: {str(e)[:200]}"
+
+
+def _sign_and_send_tx(swap_response, keypair):
+    """Sign Jupiter swap transaction and send to Solana RPC."""
+    if not SOLDERS_AVAILABLE:
+        return None, "solders library not installed — cannot sign transactions"
+    try:
+        tx_bytes = base64.b64decode(swap_response["swapTransaction"])
+        tx = SoldersVersionedTx.from_bytes(tx_bytes)
+        signed_tx = SoldersVersionedTx(tx.message, [keypair])
+        raw_tx = bytes(signed_tx)
+        tx_b64 = base64.b64encode(raw_tx).decode("ascii")
+
+        result = _rpc_call("sendTransaction", [
+            tx_b64,
+            {"encoding": "base64", "skipPreflight": False,
+             "preflightCommitment": "confirmed"}
+        ], timeout=30)
+
+        if "error" in result:
+            return None, f"sendTransaction: {result.get('detail', result.get('error'))}"
+        signature = result.get("result")
+        return signature, None
+    except Exception as e:
+        return None, f"Sign/send failed: {str(e)[:300]}"
+
+
+def _auto_sell_position(mint, wallet_private_key_b58, jupiter_api_key,
+                        slippage_bps=AUTO_SELL_DEFAULT_SLIPPAGE_BPS):
+    """
+    Emergency sell: dump ALL tokens of a mint back to SOL via Jupiter.
+    Called directly from the surveillance loop — zero agent latency.
+    """
+    if not SOLDERS_AVAILABLE:
+        return {"success": False, "error": "solders not installed"}
+    try:
+        keypair = SoldersKeypair.from_base58_string(wallet_private_key_b58)
+        public_key = str(keypair.pubkey())
+
+        # Get wallet's token balance for this mint
+        balance = _get_wallet_balance_for_mint(public_key, mint)
+        if balance <= 0:
+            return {"success": False, "error": "No token balance to sell", "balance": 0}
+
+        print(f"[AUTO-SELL] Selling {balance} raw tokens of {mint[:12]}...")
+
+        # Step 1: Jupiter quote (token → SOL)
+        quote, err = _jupiter_get_quote(mint, SOL_MINT, balance, slippage_bps,
+                                        jupiter_api_key)
+        if err:
+            return {"success": False, "error": f"Quote: {err}"}
+
+        # Step 2: Get swap transaction
+        swap_resp, err = _jupiter_get_swap_tx(quote, public_key, jupiter_api_key)
+        if err:
+            return {"success": False, "error": f"SwapTx: {err}"}
+
+        # Step 3: Sign and send
+        signature, err = _sign_and_send_tx(swap_resp, keypair)
+        if err:
+            return {"success": False, "error": f"Send: {err}"}
+
+        print(f"[AUTO-SELL] SUCCESS — {mint[:12]}... sold, sig: {signature}")
+        return {
+            "success": True,
+            "signature": signature,
+            "tokens_sold": balance,
+            "input_mint": mint,
+            "output_mint": SOL_MINT,
+            "slippage_bps": slippage_bps,
+            "out_amount": quote.get("outAmount", "0"),
+            "price_impact": quote.get("priceImpactPct", "0"),
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Exception: {str(e)[:300]}"}
+
+
+# ---------------------------------------------------------------------------
+# Liquidity Pool Analysis (v4.0)
+# ---------------------------------------------------------------------------
+def _check_liquidity_pool(mint, jupiter_api_key=None):
+    """
+    Check liquidity pool status for a token:
+    1. Verify tradeable liquidity exists via Jupiter quote
+    2. Get pool type and price impact
+    3. Check LP token burn status for Raydium pools
+    """
+    result = {
+        "has_liquidity": False,
+        "liquidity_locked": None,
+        "pool_type": None,
+        "pool_address": None,
+        "lp_burn_pct": None,
+        "price_impact_pct": None,
+        "signals": [],
+        "error": None,
+    }
+
+    try:
+        # Step 1: Jupiter quote with 0.1 SOL to test liquidity
+        test_amount = 100_000_000  # 0.1 SOL in lamports
+        quote, err = _jupiter_get_quote(SOL_MINT, mint, test_amount, 1000,
+                                        jupiter_api_key)
+        if err or not quote:
+            result["error"] = f"No liquidity: {err}"
+            result["signals"].append("CRITICAL: No tradeable liquidity on any DEX")
+            return result
+
+        result["has_liquidity"] = True
+
+        # Extract route info
+        route_plan = quote.get("routePlan", [])
+        if route_plan:
+            swap_info = route_plan[0].get("swapInfo", {})
+            result["pool_type"] = swap_info.get("label", "unknown")
+            result["pool_address"] = swap_info.get("ammKey", "")
+
+        # Price impact
+        try:
+            result["price_impact_pct"] = round(float(
+                quote.get("priceImpactPct", "0")), 4)
+        except (ValueError, TypeError):
+            pass
+
+        # Step 2: Check LP burn for Raydium pools
+        pool_addr = result.get("pool_address")
+        if pool_addr:
+            lp_info = _check_lp_burn(pool_addr)
+            result["liquidity_locked"] = lp_info.get("locked")
+            result["lp_burn_pct"] = lp_info.get("burn_pct")
+            if lp_info.get("lp_mint"):
+                result["lp_mint"] = lp_info["lp_mint"]
+            result["signals"].extend(lp_info.get("signals", []))
+
+        # Price impact signals
+        if result["price_impact_pct"] is not None:
+            impact = abs(result["price_impact_pct"])
+            if impact > 10:
+                result["signals"].append(
+                    f"HIGH: Price impact {impact:.2f}% — very thin liquidity")
+            elif impact > 3:
+                result["signals"].append(
+                    f"MODERATE: Price impact {impact:.2f}% — low liquidity")
+            else:
+                result["signals"].append(
+                    f"OK: Price impact {impact:.2f}% — decent liquidity")
+
+    except Exception as e:
+        result["error"] = str(e)[:200]
+
+    return result
+
+
+def _check_lp_burn(pool_address):
+    """Check if LP tokens for a pool are burned/locked."""
+    result = {"locked": None, "burn_pct": None, "lp_mint": None, "signals": []}
+
+    try:
+        # Fetch pool account raw bytes
+        raw = _rpc_call("getAccountInfo", [
+            pool_address,
+            {"encoding": "base64", "commitment": "confirmed"}
+        ])
+
+        if not raw or "error" in raw:
+            result["signals"].append("Could not fetch pool account")
+            return result
+
+        value = raw.get("result", {}).get("value")
+        if not value:
+            result["signals"].append("Pool account not found")
+            return result
+
+        owner = value.get("owner", "")
+        data = value.get("data", [])
+        if not data or not isinstance(data, list) or len(data) < 1:
+            result["signals"].append("No pool data")
+            return result
+
+        # Decode raw bytes
+        account_bytes = base64.b64decode(data[0])
+
+        # Raydium AMM v4: LP mint at offset 464 (32 bytes)
+        if owner == RAYDIUM_AMM_V4_PROGRAM and len(account_bytes) >= 496:
+            lp_mint_bytes = account_bytes[464:496]
+            lp_mint = _bytes_to_base58(lp_mint_bytes)
+            result["lp_mint"] = lp_mint
+            _check_lp_holders(lp_mint, result)
+
+        # Raydium CPMM: LP mint at offset 225 (32 bytes)
+        elif owner == RAYDIUM_CPMM_PROGRAM and len(account_bytes) >= 257:
+            lp_mint_bytes = account_bytes[225:257]
+            lp_mint = _bytes_to_base58(lp_mint_bytes)
+            result["lp_mint"] = lp_mint
+            _check_lp_holders(lp_mint, result)
+
+        else:
+            result["signals"].append(
+                f"Pool program {owner[:16]}... — LP burn check not supported")
+
+    except Exception as e:
+        result["signals"].append(f"LP check error: {str(e)[:200]}")
+
+    return result
+
+
+def _check_lp_holders(lp_mint, result):
+    """Check LP token holders to determine burn percentage."""
+    try:
+        # Get LP supply
+        lp_info = fetch_account_info(lp_mint)
+        lp_parsed = parse_mint_info(lp_info)
+        lp_supply_str = lp_parsed.get("supply")
+        lp_supply = int(lp_supply_str) if lp_supply_str else 0
+        if lp_supply <= 0:
+            result["signals"].append("LP supply is zero")
+            return
+
+        # Get largest LP holders
+        holders_raw = fetch_token_largest_accounts(lp_mint)
+        if not holders_raw or "error" in holders_raw:
+            result["signals"].append("Could not fetch LP holders")
+            return
+
+        holders = holders_raw.get("result", {}).get("value", [])
+        if not holders:
+            result["signals"].append("No LP holders found")
+            return
+
+        # Check each holder — resolve owner to see if it's a burn address
+        total_burned = 0
+        for h in holders:
+            amount = int(h.get("amount", "0"))
+            token_acct = h.get("address", "")
+
+            # Check if the token account itself is a burn address
+            if token_acct in LP_BURN_ADDRESSES:
+                total_burned += amount
+                continue
+
+            # Resolve owner wallet
+            owner = _resolve_token_account_owner(token_acct)
+            if owner and owner in LP_BURN_ADDRESSES:
+                total_burned += amount
+
+        burn_pct = (total_burned / lp_supply) * 100.0
+        result["burn_pct"] = round(burn_pct, 2)
+
+        if burn_pct > 95:
+            result["locked"] = True
+            result["signals"].append(
+                f"LP {burn_pct:.1f}% burned — liquidity LOCKED")
+        elif burn_pct > 50:
+            result["locked"] = False
+            result["signals"].append(
+                f"LP partially burned ({burn_pct:.1f}%) — NOT fully locked")
+        else:
+            result["locked"] = False
+            result["signals"].append(
+                f"LP only {burn_pct:.1f}% burned — liquidity UNLOCKED")
+
+    except Exception as e:
+        result["signals"].append(f"LP holder check error: {str(e)[:200]}")
+
+
+# ---------------------------------------------------------------------------
 # Trigger Evaluation (v3.0)
 # ---------------------------------------------------------------------------
 def _evaluate_triggers(entry, current_snap, dev_fanout_dests, whale_fanout_results):
@@ -1087,7 +1429,8 @@ def _evaluate_triggers(entry, current_snap, dev_fanout_dests, whale_fanout_resul
 # Monitor Loop (v3.0)
 # ---------------------------------------------------------------------------
 def _poll_single_mint(mint):
-    """Poll a single watched mint: fetch balances, check fan-out, evaluate triggers."""
+    """Poll a single watched mint: fetch balances, check fan-out, evaluate triggers.
+    v4.0: If auto_sell is enabled and severity >= threshold, execute emergency sell."""
     with _watched_mints_lock:
         if mint not in _watched_mints:
             return
@@ -1134,12 +1477,42 @@ def _poll_single_mint(mint):
         for a in new_alerts:
             live["alerts"].append(a)
         _update_severity(live)
+        current_severity = live["severity"]
+        already_sold = live.get("auto_sell_executed", False)
 
     # Append to global alerts
     if new_alerts:
         with _global_alerts_lock:
             for a in new_alerts:
                 _global_alerts.append(a)
+
+    # ---- v4.0: AUTO-SELL CHECK ----
+    if (entry.get("auto_sell") and not already_sold and SOLDERS_AVAILABLE):
+        threshold = entry.get("auto_sell_severity", AUTO_SELL_SEVERITY_THRESHOLD)
+        threshold_val = SEVERITY_ORDER.get(threshold, 3)
+        current_val = SEVERITY_ORDER.get(current_severity, 0)
+
+        if current_val >= threshold_val:
+            print(f"[AUTO-SELL] TRIGGERED for {mint[:12]}... severity={current_severity}")
+            wallet_key = entry.get("wallet_private_key", "")
+            jupiter_key = entry.get("jupiter_api_key", "")
+            slippage = entry.get("auto_sell_slippage_bps", AUTO_SELL_DEFAULT_SLIPPAGE_BPS)
+
+            sell_result = _auto_sell_position(mint, wallet_key, jupiter_key, slippage)
+
+            # Record the sell result
+            sell_alert = _create_alert(mint, "AUTO_SELL", current_severity,
+                f"Auto-sell executed: {'SUCCESS' if sell_result.get('success') else 'FAILED'}",
+                sell_result)
+
+            with _watched_mints_lock:
+                if mint in _watched_mints:
+                    _watched_mints[mint]["auto_sell_executed"] = True
+                    _watched_mints[mint]["auto_sell_result"] = sell_result
+                    _watched_mints[mint]["alerts"].append(sell_alert)
+
+            with _global_alerts_lock:
+                _global_alerts.append(sell_alert)
 
 
 def _monitor_loop():
@@ -1420,6 +1793,35 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         triggered_signals.append("INFO: No dev wallet/signatures — tx analysis skipped")
 
     # =====================================================================
+    # STEP 7b: Liquidity Pool Analysis (NEW in v4.0)
+    # =====================================================================
+    try:
+        jupiter_api_key = request.headers.get("X-Jupiter-Api-Key", "")
+    except RuntimeError:
+        jupiter_api_key = ""
+    lp_analysis = None
+    try:
+        lp_analysis = _check_liquidity_pool(mint, jupiter_api_key)
+        if lp_analysis:
+            if not lp_analysis.get("has_liquidity"):
+                risk_score += 15
+                triggered_signals.append(
+                    "CRITICAL: No tradeable liquidity found on any DEX (+15)")
+            elif lp_analysis.get("liquidity_locked") is False:
+                risk_score += 10
+                triggered_signals.append(
+                    f"HIGH: Liquidity NOT locked (LP burn: {lp_analysis.get('lp_burn_pct', 0):.1f}%, +10)")
+            elif lp_analysis.get("liquidity_locked") is True:
+                triggered_signals.append(
+                    f"OK: Liquidity locked (LP burn: {lp_analysis.get('lp_burn_pct', 0):.1f}%)")
+            # Add LP signals to triggered_signals
+            for sig in lp_analysis.get("signals", []):
+                if sig not in triggered_signals:
+                    triggered_signals.append(f"LP: {sig}")
+    except Exception as e:
+        triggered_signals.append(f"WARN: LP check failed: {str(e)[:100]}")
+
+    # =====================================================================
     # STEP 8: Decision — STRICTER THRESHOLDS (v2.0)
     # =====================================================================
     risk_score = min(risk_score, 100)
@@ -1460,12 +1862,13 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "dev_holdings": dev_holdings,
         "tx_signals": tx_signals,
         "supply_change_flag": supply_change_flag,
+        "liquidity_pool": lp_analysis,
         "risk_score": risk_score,
         "risk_level": risk_level,
         "decision": decision,
         "triggered_signals": triggered_signals,
         "timestamp": timestamp,
-        "version": "3.0.0",
+        "version": "4.0.0",
     }
 
     _cache_set(_snapshot_cache, mint, {
@@ -1495,12 +1898,14 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
                       "dev_holdings", "tx_pattern_analysis",
                       "holder_concentration", "token_age", "dev_dump_penalty",
                       "strict_thresholds", "whale_surveillance", "dev_dump_monitor",
-                      "fanout_detection", "exchange_exit_detection"],
+                      "fanout_detection", "exchange_exit_detection",
+                      "jupiter_auto_sell", "lp_lock_analysis", "manual_sell"],
+        "auto_sell_available": SOLDERS_AVAILABLE,
         "surveillance": {
             "active": _monitor_thread is not None and _monitor_thread.is_alive(),
             "watched_mints": watched_count,
@@ -1561,7 +1966,9 @@ def snapshot_endpoint():
 # ---------------------------------------------------------------------------
 @app.route("/watch", methods=["POST"])
 def watch_endpoint():
-    """Register a mint for continuous surveillance after entry."""
+    """Register a mint for continuous surveillance after entry.
+    v4.0: Accepts auto_sell=true to enable Jupiter auto-sell on rug detection.
+    Wallet key and Jupiter key read from headers (OnDemand tool config)."""
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({"error": "Request body must be valid JSON"}), 400
@@ -1571,6 +1978,22 @@ def watch_endpoint():
         return jsonify({"error": "Missing or invalid 'mint'. Must be a Solana mint address."}), 400
 
     poll_interval = data.get("poll_interval", MONITOR_DEFAULT_INTERVAL)
+
+    # v4.0: Auto-sell configuration
+    auto_sell = data.get("auto_sell", False)
+    auto_sell_slippage = data.get("auto_sell_slippage_bps", AUTO_SELL_DEFAULT_SLIPPAGE_BPS)
+    auto_sell_severity = data.get("auto_sell_severity", AUTO_SELL_SEVERITY_THRESHOLD)
+
+    # Read wallet key and Jupiter key from headers (OnDemand tool config)
+    wallet_private_key = request.headers.get("X-Wallet-Private-Key", "")
+    jupiter_api_key = request.headers.get("X-Jupiter-Api-Key", "")
+
+    # Validate auto-sell requirements
+    if auto_sell:
+        if not SOLDERS_AVAILABLE:
+            return jsonify({"error": "Auto-sell unavailable: solders library not installed"}), 500
+        if not wallet_private_key:
+            return jsonify({"error": "Auto-sell requires X-Wallet-Private-Key header"}), 400
 
     with _watched_mints_lock:
         if mint in _watched_mints:
@@ -1633,6 +2056,14 @@ def watch_endpoint():
             "severity": "NONE",
             "last_checked": time.time(),
             "poll_interval": poll_interval,
+            # v4.0: Auto-sell config stored in entry
+            "auto_sell": auto_sell,
+            "auto_sell_slippage_bps": auto_sell_slippage,
+            "auto_sell_severity": auto_sell_severity,
+            "auto_sell_executed": False,
+            "auto_sell_result": None,
+            "wallet_private_key": wallet_private_key if auto_sell else "",
+            "jupiter_api_key": jupiter_api_key if auto_sell else "",
         }
         entry["history"].append((entry_snapshot["timestamp"], entry_snapshot))
 
@@ -1655,6 +2086,8 @@ def watch_endpoint():
             },
             "poll_interval": poll_interval,
             "supply": supply,
+            "auto_sell_enabled": auto_sell,
+            "auto_sell_severity": auto_sell_severity if auto_sell else None,
         }), 201
 
     except Exception as e:
@@ -1722,6 +2155,13 @@ def status_endpoint():
         "alerts_count": len(entry.get("alerts", [])),
         "recent_alerts": entry.get("alerts", [])[-5:],  # Last 5
         "poll_interval": entry.get("poll_interval", MONITOR_DEFAULT_INTERVAL),
+        # v4.0: Auto-sell status
+        "auto_sell": {
+            "enabled": entry.get("auto_sell", False),
+            "severity_threshold": entry.get("auto_sell_severity"),
+            "executed": entry.get("auto_sell_executed", False),
+            "result": entry.get("auto_sell_result"),
+        },
     })
 
 
@@ -1779,23 +2219,107 @@ def unwatch_endpoint():
         "total_alerts": len(entry.get("alerts", [])),
         "flags": entry.get("flags", {}),
         "remaining_watches": remaining,
+        # v4.0: Include auto-sell result if it was executed
+        "auto_sell_executed": entry.get("auto_sell_executed", False),
+        "auto_sell_result": entry.get("auto_sell_result"),
     })
+
+
+# ---------------------------------------------------------------------------
+# Manual Emergency Sell (v4.0)
+# ---------------------------------------------------------------------------
+@app.route("/sell", methods=["POST"])
+def sell_endpoint():
+    """
+    Manual emergency sell: dump all tokens of a mint back to SOL via Jupiter.
+    Reads wallet key from X-Wallet-Private-Key header (OnDemand tool config).
+    """
+    if not SOLDERS_AVAILABLE:
+        return jsonify({"error": "solders library not installed — sell unavailable"}), 500
+
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be valid JSON"}), 400
+
+    mint = data.get("mint")
+    if not mint or not isinstance(mint, str) or len(mint) < 32:
+        return jsonify({"error": "Missing or invalid 'mint'"}), 400
+
+    slippage_bps = data.get("slippage_bps", AUTO_SELL_DEFAULT_SLIPPAGE_BPS)
+
+    # Read keys from headers
+    wallet_key = request.headers.get("X-Wallet-Private-Key", "")
+    jupiter_key = request.headers.get("X-Jupiter-Api-Key", "")
+
+    if not wallet_key:
+        return jsonify({"error": "X-Wallet-Private-Key header required"}), 400
+
+    try:
+        result = _auto_sell_position(mint, wallet_key, jupiter_key, slippage_bps)
+        status_code = 200 if result.get("success") else 500
+        result["mint"] = mint
+        result["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+        # If this mint is being watched, record the sell
+        with _watched_mints_lock:
+            if mint in _watched_mints:
+                _watched_mints[mint]["auto_sell_executed"] = True
+                _watched_mints[mint]["auto_sell_result"] = result
+
+        return jsonify(result), status_code
+    except Exception as e:
+        return jsonify({
+            "error": "sell_failed",
+            "detail": str(e)[:500],
+            "mint": mint,
+        }), 500
+
+
+# ---------------------------------------------------------------------------
+# LP Check Endpoint (v4.0)
+# ---------------------------------------------------------------------------
+@app.route("/lp", methods=["POST"])
+def lp_endpoint():
+    """Check liquidity pool status for a token."""
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be valid JSON"}), 400
+
+    mint = data.get("mint")
+    if not mint or not isinstance(mint, str) or len(mint) < 32:
+        return jsonify({"error": "Missing or invalid 'mint'"}), 400
+
+    jupiter_key = request.headers.get("X-Jupiter-Api-Key", "")
+
+    try:
+        lp_result = _check_liquidity_pool(mint, jupiter_key)
+        lp_result["mint"] = mint
+        lp_result["timestamp"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(lp_result)
+    except Exception as e:
+        return jsonify({
+            "error": "lp_check_failed",
+            "detail": str(e)[:500],
+            "mint": mint,
+        }), 500
 
 
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
         "service": "Rapid Rug Filter",
-        "description": "Solana meme coin rug risk scanner with whale + dev surveillance",
-        "version": "3.0.0",
+        "description": "Solana meme coin rug risk scanner with auto-sell guardian + LP analysis",
+        "version": "4.0.0",
         "endpoints": {
             "GET /health": "Health check with surveillance status",
-            "POST /analyze": "Analyze token mint for rug risk (auto-detects dev wallet)",
+            "POST /analyze": "Analyze token mint for rug risk (includes LP check)",
             "GET /snapshot?mint=...": "Get cached analysis snapshot",
-            "POST /watch": "Start continuous surveillance on a mint after entry",
-            "GET /status?mint=...": "Get surveillance flags, severity, and change percentages",
+            "POST /watch": "Start surveillance with optional auto-sell protection",
+            "GET /status?mint=...": "Get surveillance flags, severity, auto-sell status",
             "GET /alerts": "Get all surveillance alerts (filter by ?mint= and ?severity=)",
             "POST /unwatch": "Stop watching a mint after exit",
+            "POST /sell": "Manual emergency sell via Jupiter (token → SOL)",
+            "POST /lp": "Check liquidity pool lock status for a token",
         },
         "analyze_body": {
             "mint": "(required) Solana token mint address",
@@ -1805,9 +2329,23 @@ def root():
         "watch_body": {
             "mint": "(required) Solana token mint address to watch",
             "poll_interval": "(optional) Seconds between polls, default 10",
+            "auto_sell": "(optional) Enable auto-sell on rug detection, default false",
+            "auto_sell_slippage_bps": "(optional) Slippage for emergency sell, default 500 (5%)",
+            "auto_sell_severity": "(optional) Min severity to trigger, default HIGH",
+        },
+        "sell_body": {
+            "mint": "(required) Token mint address to sell",
+            "slippage_bps": "(optional) Slippage in basis points, default 500",
+        },
+        "lp_body": {
+            "mint": "(required) Token mint address to check LP for",
         },
         "unwatch_body": {
             "mint": "(required) Solana token mint address to stop watching",
+        },
+        "headers": {
+            "X-Wallet-Private-Key": "Solana wallet private key (base58) — for /sell and /watch auto_sell",
+            "X-Jupiter-Api-Key": "Jupiter API key — for /sell, /watch auto_sell, and /lp",
         },
     })
 

@@ -1,0 +1,365 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Rapid Rug Filter API",
+    "version": "5.0.0",
+    "description": "Solana token rug-pull detection, surveillance, auto-sell protection, and portfolio auto-pilot. Analyzes tokens for rug signals (LP locks, dev wallets, holder concentration, metadata changes), watches tokens with continuous monitoring, auto-sells on high-severity threats, and monitors wallet holdings automatically."
+  },
+  "servers": [
+    {
+      "url": "https://serverless.on-demand.io/apps/rapid-rug-filter"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Health check and system status",
+        "description": "Returns service health, version, active watches, portfolio auto-pilot status, and feature list.",
+        "responses": {
+          "200": {
+            "description": "Service health status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Health check response with version, uptime, and feature info"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyze": {
+      "post": {
+        "operationId": "analyzeToken",
+        "summary": "Analyze a Solana token for rug-pull risk",
+        "description": "Deep analysis of a Solana SPL token: LP status, dev wallet detection, holder concentration, metadata mutability, token age, and overall risk scoring. Returns risk_level (SAFE/LOW/MEDIUM/HIGH/CRITICAL) and actionable decision.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["mint"],
+                "properties": {
+                  "mint": {
+                    "type": "string",
+                    "description": "Solana token mint address (base58 public key)"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token analysis results with risk scoring",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Analysis results including risk_score, risk_level, decision, and detailed checks"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/watch": {
+      "post": {
+        "operationId": "watchToken",
+        "summary": "Start surveillance on a token after buying",
+        "description": "Register a token for continuous rug-pull surveillance. Monitors LP changes, holder shifts, metadata mutations, and dev wallet activity. Optionally enables auto-sell on high-severity threats.",
+        "parameters": [
+          {
+            "name": "X-Wallet-Address",
+            "in": "header",
+            "required": false,
+            "description": "Wallet public key (for position tracking)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["mint"],
+                "properties": {
+                  "mint": {
+                    "type": "string",
+                    "description": "Solana token mint address to watch"
+                  },
+                  "wallet_private_key": {
+                    "type": "string",
+                    "description": "Base58 wallet private key for auto-sell (required if auto_sell=true)"
+                  },
+                  "auto_sell": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable automatic selling when severity reaches HIGH or above"
+                  },
+                  "priority": {
+                    "type": "string",
+                    "enum": ["NORMAL", "EMERGENCY"],
+                    "default": "NORMAL",
+                    "description": "EMERGENCY: faster polling, lower auto-sell threshold"
+                  },
+                  "jupiter_api_key": {
+                    "type": "string",
+                    "description": "Jupiter aggregator API key for swap execution"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token watch started successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Watch confirmation with initial snapshot data"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "getTokenStatus",
+        "summary": "Get surveillance status for a watched token",
+        "description": "Returns current severity, flags, alerts, auto-sell status, and balance changes for a token under surveillance.",
+        "parameters": [
+          {
+            "name": "mint",
+            "in": "query",
+            "required": true,
+            "description": "Solana token mint address to check status for",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current surveillance status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Surveillance status including severity, flags, alerts, and snapshot data"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/unwatch": {
+      "post": {
+        "operationId": "unwatchToken",
+        "summary": "Stop watching a token",
+        "description": "Remove a token from surveillance. Use after selling a position.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["mint"],
+                "properties": {
+                  "mint": {
+                    "type": "string",
+                    "description": "Solana token mint address to stop watching"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token unwatched successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Unwatch confirmation"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sell": {
+      "post": {
+        "operationId": "sellToken",
+        "summary": "Execute emergency sell of a token position",
+        "description": "Immediately sell all holdings of a token via Jupiter swap to SOL. Wallet credentials are injected automatically via configured headers (X-Wallet-Private-Key, X-Jupiter-Api-Key). Falls back to active Portfolio Auto-Pilot keys if headers not present.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["mint"],
+                "properties": {
+                  "mint": {
+                    "type": "string",
+                    "description": "Solana token mint address to sell"
+                  },
+                  "slippage_bps": {
+                    "type": "integer",
+                    "default": 1500,
+                    "description": "Slippage tolerance in basis points (default 1500 = 15%)"
+                  },
+                  "priority": {
+                    "type": "string",
+                    "default": "EMERGENCY",
+                    "description": "Sell priority: EMERGENCY (high fees + retries) or NORMAL"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sell executed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Sell result with transaction signature and amounts"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No token balance to sell (token not in wallet or already sold)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Error response indicating the wallet has zero balance of this token"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/portfolio/start": {
+      "post": {
+        "operationId": "startPortfolio",
+        "summary": "Start Portfolio Auto-Pilot",
+        "description": "Start continuous wallet monitoring. Automatically detects new token purchases, runs analysis, sets up surveillance with auto-sell, and tracks all holdings. Idempotent: if already running for same wallet, returns current state. Call this at the start of every conversation.",
+        "parameters": [
+          {
+            "name": "X-Wallet-Address",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet public key to monitor",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Wallet-Private-Key",
+            "in": "header",
+            "required": true,
+            "description": "Wallet private key for auto-sell execution",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Jupiter-Api-Key",
+            "in": "header",
+            "required": false,
+            "description": "Jupiter aggregator API key for swap execution",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Portfolio Auto-Pilot started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Start confirmation with scan interval and settings"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Already running for this wallet (idempotent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Current portfolio state"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/portfolio": {
+      "get": {
+        "operationId": "getPortfolio",
+        "summary": "Get portfolio status and all holdings",
+        "description": "Returns the complete portfolio state: all token holdings with watch status, severity, alerts, auto-sell results, and recent events. This is the source of truth for wallet holdings.",
+        "responses": {
+          "200": {
+            "description": "Portfolio state with holdings and events",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Full portfolio state including summary stats, enriched holdings, and event log"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/portfolio/stop": {
+      "post": {
+        "operationId": "stopPortfolio",
+        "summary": "Stop Portfolio Auto-Pilot",
+        "description": "Stop the wallet scanner. Surveillance continues on already-watched tokens. Use /unwatch to stop individual watches.",
+        "responses": {
+          "200": {
+            "description": "Portfolio scanner stopped",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Stop confirmation with final stats and events"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

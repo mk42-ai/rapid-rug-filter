@@ -2818,12 +2818,31 @@ def sell_endpoint():
     slippage_bps = data.get("slippage_bps")  # None = use profile default
     event_id = data.get("event_id")
 
-    # Read keys from headers
-    wallet_key = request.headers.get("X-Wallet-Private-Key", "")
-    jupiter_key = request.headers.get("X-Jupiter-Api-Key", "")
+    # Read keys: prefer headers (OnDemand config keys), fallback to body, then portfolio state
+    wallet_key = request.headers.get("X-Wallet-Private-Key", "").strip()
+    jupiter_key = request.headers.get("X-Jupiter-Api-Key", "").strip()
+
+    # Fallback to body params (some agents pass keys in body per schema)
+    if not wallet_key:
+        body_key = data.get("wallet_private_key", "")
+        if body_key and isinstance(body_key, str) and len(body_key) > 32 and "<" not in body_key:
+            wallet_key = body_key
+    if not jupiter_key:
+        body_jup = data.get("jupiter_api_key", "")
+        if body_jup and isinstance(body_jup, str) and len(body_jup) > 8 and "<" not in body_jup:
+            jupiter_key = body_jup
+
+    # Last resort: read from active portfolio state
+    if not wallet_key or not jupiter_key:
+        with _portfolio_state_lock:
+            if _portfolio_state and _portfolio_state.get("active"):
+                if not wallet_key:
+                    wallet_key = _portfolio_state.get("wallet_private_key", "")
+                if not jupiter_key:
+                    jupiter_key = _portfolio_state.get("jupiter_api_key", "")
 
     if not wallet_key:
-        return jsonify({"error": "X-Wallet-Private-Key header required"}), 400
+        return jsonify({"error": "Wallet private key required (header X-Wallet-Private-Key, body wallet_private_key, or active portfolio)"}), 400
 
     try:
         result = _auto_sell_position(
@@ -2832,7 +2851,17 @@ def sell_endpoint():
             priority=priority,
             event_id=event_id,
         )
-        status_code = 200 if result.get("success") else 500
+        # Map specific errors to appropriate HTTP status codes
+        if result.get("success"):
+            status_code = 200
+        elif "No token balance" in result.get("error", ""):
+            status_code = 404  # Not found — token not in wallet
+        elif "solders not installed" in result.get("error", ""):
+            status_code = 503  # Service unavailable
+        elif "Quote:" in result.get("error", "") or "SwapTx:" in result.get("error", ""):
+            status_code = 502  # Bad gateway — upstream Jupiter error
+        else:
+            status_code = 500  # Genuine server error
         result["mint"] = mint
         result["timestamp"] = datetime.now(timezone.utc).isoformat()
 
@@ -2931,17 +2960,17 @@ def portfolio_start_endpoint():
                     },
                 }), 200
 
-    # Conflict: portfolio already running for a DIFFERENT wallet
+    # Auto-replace: portfolio running for a DIFFERENT wallet → stop old, start new
     with _portfolio_state_lock:
         if _portfolio_state and _portfolio_state.get("active"):
             running_wallet = _portfolio_state.get("wallet_address", "")
             if running_wallet != wallet_address:
-                return jsonify({
-                    "error": "Portfolio Auto-Pilot already running for a different wallet",
-                    "running_wallet": running_wallet[:8] + "...",
-                    "requested_wallet": wallet_address[:8] + "...",
-                    "hint": "Call POST /portfolio/stop first, then start with the new wallet",
-                }), 409
+                print(f"[PORTFOLIO] Auto-replacing wallet {running_wallet[:12]}... "
+                      f"→ {wallet_address[:12]}...")
+                _portfolio_add_event("PORTFOLIO_WALLET_REPLACED", None,
+                    f"Auto-replacing wallet {running_wallet[:12]}... "
+                    f"with {wallet_address[:12]}...")
+                # Fall through to stop + restart below
 
     # Stop existing portfolio if running (same wallet restart case)
     _stop_portfolio_thread()

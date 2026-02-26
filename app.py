@@ -109,7 +109,7 @@ KNOWN_EXCHANGE_ADDRESSES = {
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 SOL_MINT = "So11111111111111111111111111111111111111112"
-AUTO_SELL_SEVERITY_THRESHOLD = "MODERATE"  # Lowered for testing (was HIGH)
+AUTO_SELL_SEVERITY_THRESHOLD = "HIGH"  # Minimum severity to trigger auto-sell
 AUTO_SELL_DEFAULT_SLIPPAGE_BPS = 1200  # 12% emergency slippage for auto-sell
 SEVERITY_ORDER = {"NONE": 0, "LOW": 1, "MODERATE": 2, "HIGH": 3, "EXTREME": 4}
 

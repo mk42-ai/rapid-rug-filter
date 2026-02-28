@@ -15,6 +15,7 @@ No RapidAPI dependency — calls Solana chain nodes directly for speed.
 import os
 import time
 import json
+import math
 import struct
 import base64
 import threading
@@ -33,6 +34,13 @@ try:
 except ImportError:
     SOLDERS_AVAILABLE = False
     print("[WARN] solders not available — auto-sell disabled")
+
+try:
+    import websocket  # websocket-client library
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    print("[WARN] websocket-client not available — pump.fun trading engine disabled")
 
 app = Flask(__name__)
 
@@ -114,17 +122,27 @@ AUTO_SELL_DEFAULT_SLIPPAGE_BPS = 1200  # 12% emergency slippage for auto-sell
 SEVERITY_ORDER = {"NONE": 0, "LOW": 1, "MODERATE": 2, "HIGH": 3, "EXTREME": 4}
 
 # ---------------------------------------------------------------------------
-# Priority Fee Profiles (v4.1) — "Bribe" tactic for rug survival
+# Priority Fee Profiles (v5.1) — Jito Tips + Dynamic Slippage
 # ---------------------------------------------------------------------------
 # NORMAL profile: standard priority, reasonable slippage
 NORMAL_SLIPPAGE_BPS = 500              # 5%
 NORMAL_CU_PRICE_MICRO_LAMPORTS = 0     # let Jupiter auto-optimize
 
-# EMERGENCY profile: maximum priority, wide slippage, aggressive retries
-EMERGENCY_SLIPPAGE_BPS = 1200          # 12% panic slippage
-EMERGENCY_CU_PRICE_MICRO_LAMPORTS = 200_000  # high bribe per CU
+# EMERGENCY profile: Jito bundle tips + dynamic slippage + aggressive retries
+EMERGENCY_SLIPPAGE_BPS = 1200          # 12% max ceiling (dynamic will use less)
+EMERGENCY_CU_PRICE_MICRO_LAMPORTS = 200_000  # fallback if Jito fails
 EMERGENCY_MAX_RETRIES = 3
 EMERGENCY_RETRY_DELAYS = [0.2, 0.5, 1.0]  # exponential backoff seconds
+
+# v5.1: Jito Bundle Tips — MEV protection + faster inclusion
+# Tip goes to Jito validators; protects against sandwich attacks that eat slippage
+JITO_TIP_LAMPORTS_BY_RETRY = [1_000_000, 3_000_000, 5_000_000]  # 0.001→0.003→0.005 SOL
+JITO_SEND_URL = "https://mainnet.block-engine.jito.wtf/api/v1/transactions"
+
+# v5.1: Dynamic Slippage — Jupiter auto-calculates optimal per route
+# Instead of fixed 12%, Jupiter finds the minimum needed (often 1-3%)
+DYNAMIC_SLIPPAGE_MIN_BPS = 50          # 0.5% floor
+DYNAMIC_SLIPPAGE_MAX_BPS_BY_RETRY = [300, 800, 1200]  # escalate: 3%→8%→12%
 
 # Idempotency: track executed emergency sells to prevent duplicates
 _emergency_event_ids = set()
@@ -156,6 +174,152 @@ PORTFOLIO_IGNORE_MINTS = {
 }
 
 # ---------------------------------------------------------------------------
+# v5.2: Dust Token Filter
+# ---------------------------------------------------------------------------
+DUST_THRESHOLD_UI_AMOUNT = 1.0       # Skip tokens with ui_amount below this (instant check)
+DUST_THRESHOLD_SOL_VALUE = 0.001     # Skip if Jupiter quote < 0.001 SOL (~$0.09)
+DUST_QUOTE_SLIPPAGE_BPS = 5000      # 50% slippage for dust quote (only care about magnitude)
+
+# ---------------------------------------------------------------------------
+# v5.2: Stop-Loss Auto-Sell
+# ---------------------------------------------------------------------------
+STOP_LOSS_ALLOWED_PCTS = {5, 10, 20}      # Allowed stop-loss percentages
+STOP_LOSS_DEFAULT_PCT = 0                   # 0 = disabled
+STOP_LOSS_CHECK_INTERVAL_SCANS = 3          # Check prices every 3rd scan (= 30s)
+STOP_LOSS_QUOTE_SLIPPAGE_BPS = 1000         # 10% slippage for price quotes
+STOP_LOSS_SELL_PRIORITY = "EMERGENCY"       # EMERGENCY = Jito tips + fast
+STOP_LOSS_MAX_QUOTE_BATCH = 10              # Max tokens to quote per check cycle
+
+# ---------------------------------------------------------------------------
+# Pump.fun Trading Engine Configuration (v6.0)
+# ---------------------------------------------------------------------------
+PUMP_WS_URL = "wss://pumpportal.fun/api/data"
+PUMP_WS_RECONNECT_DELAY = 3           # seconds between reconnect attempts
+PUMP_WS_MAX_RECONNECT_DELAY = 30      # max backoff
+PUMP_WS_PING_INTERVAL = 20            # ping every 20s to keep alive
+PUMP_WS_PING_TIMEOUT = 10             # drop if no pong in 10s
+
+PUMP_EVAL_INTERVAL = 2                 # seconds between evaluations (v6.3: was 5)
+PUMP_TOKEN_MAX_AGE = 600               # 10 min: remove inactive tokens
+PUMP_MAX_TRACKED_TOKENS = 200          # max tokens in memory
+PUMP_MAX_POSITIONS = 5                 # max concurrent open positions (v6.3: was 10, concentrate capital)
+PUMP_MAX_SOL_BUDGET_DEFAULT = 1.0      # default max SOL budget (configurable)
+PUMP_TRADE_WINDOW_SECONDS = 60         # sliding window for metrics
+PUMP_EVENTS_MAXLEN = 1000              # max events in trading log
+
+# Entry modes: {mode: {min_pump_score, position_size_pct, min_wallets, min_trades, min_vol_sol, min_buy_ratio}}
+PUMP_ENTRY_MODES = {
+    "conservative": {"min_pump_score": 80, "position_size_pct": 0.05,
+                     "min_wallets": 15, "min_trades": 30, "min_vol_sol": 5.0, "min_buy_ratio": 0.70},
+    "balanced":     {"min_pump_score": 60, "position_size_pct": 0.10,
+                     "min_wallets": 8,  "min_trades": 15, "min_vol_sol": 2.0, "min_buy_ratio": 0.60},
+    "aggressive":   {"min_pump_score": 70, "position_size_pct": 0.20,
+                     "min_wallets": 15, "min_trades": 20, "min_vol_sol": 3.0, "min_buy_ratio": 0.65},
+}
+
+# Take-profit multiplier modes
+PUMP_TP_MODES = {"2x": 2.0, "3x": 3.0, "5x": 5.0, "10x": 10.0, "15x": 15.0}
+
+# Trailing stop + fail-safes
+PUMP_TRAILING_STOP_DEFAULT_PCT = 30    # 30% drop from peak triggers sell
+PUMP_FAILSAFE_BUY_RATIO_FLOOR = 0.40  # sell if buy_ratio drops below 40% (raised from 35%)
+PUMP_FAILSAFE_LIQUIDITY_DROP_PCT = 50  # sell if reserves drop 50%+
+PUMP_FAILSAFE_VELOCITY_COLLAPSE = 2   # <2 trades in 60s after 2min = collapse
+
+# Execution params (Jupiter fallback)
+PUMP_BUY_SLIPPAGE_BPS = 800           # 8% slippage for buys
+PUMP_BUY_PRIORITY = "NORMAL"          # normal priority for buys
+PUMP_SELL_SLIPPAGE_BPS = 1200         # 12% slippage for sells
+PUMP_SELL_PRIORITY = "EMERGENCY"      # EMERGENCY = Jito tips + retries for exits
+
+# PumpPortal bonding curve trading (v6.3 — replaces Jupiter for pump.fun tokens)
+PUMP_PORTAL_TRADE_URL = "https://pumpportal.fun/api/trade-local"
+PUMP_CURVE_BUY_SLIPPAGE = 25          # 25% slippage for bonding curve buys
+PUMP_CURVE_SELL_SLIPPAGE = 25         # 25% for sells
+PUMP_CURVE_BUY_PRIORITY_FEE = 0.002   # SOL priority fee for buys
+PUMP_CURVE_SELL_PRIORITY_FEE = 0.005  # higher priority for urgent sells
+
+# ---------------------------------------------------------------------------
+# Predator Network Alpha (PNA) Configuration (v7.0)
+# ---------------------------------------------------------------------------
+# Wallet DNA Profiler — cross-token reputation tracking
+PNA_WALLET_MEMORY_MAX = 10000         # max wallets in DNA database
+PNA_WALLET_MEMORY_TTL = 3600          # 1 hour — forget wallets not seen in this window
+PNA_WALLET_MIN_PROFIT_MULT = 1.5      # 1.5x = wallet was on a token that pumped 50%+
+PNA_WALLET_WIN_SCORE_PER_HIT = 20.0   # score boost per profitable token a wallet appeared on
+PNA_WALLET_WIN_SCORE_DECAY = 0.85     # decay factor per eval cycle (recency bias)
+PNA_WALLET_MAX_SCORE = 100.0          # cap wallet reputation
+PNA_SMART_MONEY_THRESHOLD = 40.0      # wallet score above this = "smart money"
+PNA_SMART_MONEY_BOOST = 25.0          # alpha score boost when smart money enters a token
+PNA_SMART_MONEY_MIN_WALLETS = 2       # need 2+ smart wallets to trigger boost
+PNA_SMART_MONEY_MAX_BOOST = 40.0      # cap smart money boost component
+
+# Early-Life Signature Analysis
+PNA_EARLY_TRADE_WINDOW = 20           # first N trades define the "birth signature"
+PNA_EARLY_MAX_SAME_WALLET_PCT = 0.40  # >40% of early trades from 1 wallet = bot/dev scam
+PNA_EARLY_MIN_DISTINCT_WALLETS = 4    # need 4+ distinct wallets in early trades for organic signal
+PNA_EARLY_IDEAL_SOL_PER_TRADE_MIN = 0.05   # moderate buy (not dust)
+PNA_EARLY_IDEAL_SOL_PER_TRADE_MAX = 2.0    # moderate buy (not whale)
+PNA_EARLY_ORGANIC_BONUS = 15.0              # alpha score boost for organic birth signature
+PNA_EARLY_SCAM_PENALTY = -30.0              # alpha score penalty for clustered/bot birth
+
+# Momentum Phase Detection — acceleration, not velocity
+PNA_ACCEL_SUB_WINDOWS = 4             # split 60s into 4x 15s sub-windows
+PNA_ACCEL_SUB_WINDOW_SEC = 15         # each sub-window length
+PNA_ACCEL_EXPONENTIAL_THRESHOLD = 1.3 # ratio threshold: each window must be 1.3x the prior
+PNA_ACCEL_BONUS_PER_WINDOW = 8.0      # alpha bonus per accelerating sub-window
+PNA_DECEL_PENALTY_PER_WINDOW = -10.0  # alpha penalty per decelerating sub-window
+PNA_ACCEL_MAX_BONUS = 25.0            # cap acceleration bonus
+PNA_ACCEL_MAX_PENALTY = -30.0         # cap deceleration penalty
+
+# Creator Wallet Behavior
+PNA_CREATOR_HOLDING_BONUS = 10.0      # bonus if creator still holds (hasn't sold)
+PNA_CREATOR_SELLING_PENALTY = -25.0   # penalty if creator is selling
+PNA_CREATOR_DUMP_THRESHOLD_PCT = 20.0 # creator sold >20% of their balance = dump signal
+
+# Bonding Curve Position (graduation proximity)
+PNA_GRADUATION_MCAP_SOL = 85.0        # ~85 SOL mcap = graduation threshold
+PNA_GRADUATION_PROXIMITY_RANGE = 15.0 # within 15 SOL of graduation = proximity bonus
+PNA_GRADUATION_BONUS = 12.0           # alpha bonus for near-graduation tokens
+
+# Anti-Correlation (Pullback Detection)
+PNA_PULLBACK_LOOKBACK_TRADES = 30     # look at last 30 trades for dip pattern
+PNA_PULLBACK_DIP_THRESHOLD = 0.15     # 15% reserve drop constitutes a "dip"
+PNA_PULLBACK_RECOVERY_THRESHOLD = 0.05  # 5% recovery from dip bottom = pullback entry
+PNA_PULLBACK_BONUS = 10.0             # alpha bonus for buying the pullback
+
+# Composite Alpha Score weights (must sum to 1.0)
+PNA_WEIGHT_SMART_MONEY = 0.30         # 30% — smart money is the primary edge
+PNA_WEIGHT_ACCELERATION = 0.25        # 25% — momentum phase
+PNA_WEIGHT_EARLY_LIFE = 0.15          # 15% — birth signature quality
+PNA_WEIGHT_CREATOR = 0.10             # 10% — creator behavior
+PNA_WEIGHT_GRADUATION = 0.10          # 10% — bonding curve position
+PNA_WEIGHT_PULLBACK = 0.10            # 10% — pullback detection
+
+# Alpha Score entry thresholds (replace pump_score thresholds)
+PNA_ENTRY_ALPHA_MIN = 50.0            # v7.2b: lowered from 62 — observation window + blacklist provide protection now
+PNA_ENTRY_FAST_TRACK_ALPHA = 75.0     # high-confidence: skip some min_trades checks
+
+# v7.2 "The Observer" — 3 radical innovations
+# INVENTION 1: Observation Window — don't buy ANY token until we've watched it for N seconds
+# Most creators dump in the first 30-60s. Every other bot tries to be FIRST. We wait.
+# This sacrifices the initial spike but eliminates ~60% of creator dump losses.
+OBSERVER_MIN_AGE_SECONDS = 15         # v7.3: 30s missed too many pumps. 15s still catches instant-dump creators (most dump in <10s)
+OBSERVER_CREATOR_CLEAR_SECONDS = 25   # creator must NOT have sold for 25s after first_seen
+
+# INVENTION 2: Adaptive TP — start at 1.25x, escalate to 2x if still accelerating
+# Data shows: 1 out of 65 trades hit 2x TP, but DOZENS peaked at 1.2-1.5x
+# We held through those peaks and lost. Capture the frequent wins.
+ADAPTIVE_TP_INITIAL = 1.15            # v7.3: lowered from 1.25x — data shows only 13% of trades reach 1.10x, 0% reach 1.25x after 30s obs window
+ADAPTIVE_TP_ESCALATED = 2.0           # hold for 2x ONLY if still accelerating at 1.25x
+ADAPTIVE_TP_ESCALATE_CONDITION_ACCEL = True  # must be accelerating to escalate
+
+# INVENTION 3: Creator Blacklist — cross-token creator reputation
+# Track every creator wallet. If they dumped a previous token, NEVER buy their new one.
+CREATOR_BLACKLIST_DUMP_THRESHOLD = 1  # creator dumped 1+ previous tokens = blacklisted
+CREATOR_BLACKLIST_MAX_SIZE = 5000     # max blacklisted creators
+
+# ---------------------------------------------------------------------------
 # Surveillance Global State (v3.0)
 # ---------------------------------------------------------------------------
 _watched_mints = {}            # mint -> entry dict
@@ -172,6 +336,36 @@ _portfolio_state = {}               # single portfolio state dict (empty = inact
 _portfolio_state_lock = threading.Lock()
 _portfolio_thread = None
 _portfolio_stop_event = threading.Event()
+
+# ---------------------------------------------------------------------------
+# Pump.fun Trading Engine Global State (v6.0)
+# ---------------------------------------------------------------------------
+_trading_engine_state = {}             # engine state dict (empty = inactive)
+_trading_engine_lock = threading.RLock()   # RLock: reentrant — _trading_add_event can nest
+_trading_ws_thread_ref = None          # WebSocket consumer thread
+_trading_eval_thread_ref = None        # Signal evaluation thread
+_trading_ws_app_ref = None             # reference to WebSocketApp for forced shutdown
+_trading_stop_event = threading.Event()
+_trading_token_states = {}             # mint -> per-token state dict
+_trading_token_states_lock = threading.Lock()
+_trading_managed_mints = set()         # mints owned by trading engine (skip in portfolio)
+_trading_managed_mints_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Predator Network Alpha (PNA) Global State (v7.0)
+# ---------------------------------------------------------------------------
+# Wallet DNA database: wallet_pubkey -> {score, tokens_bought, wins, last_seen, ...}
+_pna_wallet_dna = {}
+_pna_wallet_dna_lock = threading.Lock()
+# Token outcome tracker: mint -> {peak_reserves_ratio, final_status, ...}
+_pna_token_outcomes = {}
+_pna_token_outcomes_lock = threading.Lock()
+# Creator wallet registry: mint -> creator_pubkey (from "create" events)
+_pna_creator_wallets = {}
+_pna_creator_wallets_lock = threading.Lock()
+# v7.2: Creator blacklist — creators who dumped previous tokens
+_pna_creator_blacklist = {}  # creator_pubkey -> {"dumps": int, "last_dump_time": float, "tokens_dumped": []}
+_pna_creator_blacklist_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +1141,19 @@ def _get_wallet_balance_for_mint(wallet, mint):
     return 0
 
 
+def _get_wallet_sol_balance(wallet_address):
+    """Get wallet's native SOL balance in lamports via getBalance RPC.
+    Returns (lamports: int, error: str|None)."""
+    try:
+        result = _rpc_call("getBalance", [wallet_address, {"commitment": "confirmed"}])
+        if "error" in result:
+            return 0, f"RPC error: {result.get('detail', result.get('error'))}"
+        lamports = result.get("result", {}).get("value", 0)
+        return lamports, None
+    except Exception as e:
+        return 0, f"getBalance failed: {str(e)[:200]}"
+
+
 def _take_snapshot(mint, dev_wallet, whale_wallets, supply):
     """Capture dev + whale balances at current moment."""
     dev_balance = 0
@@ -1118,9 +1325,10 @@ def _jupiter_get_quote(input_mint, output_mint, amount_raw, slippage_bps, jupite
 
 
 def _jupiter_get_swap_tx(quote_response, user_public_key, jupiter_api_key=None,
-                         emergency=False):
+                         emergency=False, retry_attempt=0):
     """Get serialized swap transaction from Jupiter.
-    emergency=True adds high priority fee (ComputeUnitPrice bribe)."""
+    v5.1: emergency=True uses Jito bundle tips + dynamic slippage.
+    retry_attempt controls escalation (higher tip + wider slippage on retries)."""
     payload = {
         "userPublicKey": user_public_key,
         "quoteResponse": quote_response,
@@ -1129,13 +1337,31 @@ def _jupiter_get_swap_tx(quote_response, user_public_key, jupiter_api_key=None,
         "dynamicComputeUnitLimit": True,
         "skipUserAccountsRpcCalls": False,
     }
-    # v4.1: Priority fee bribe — validators prioritize higher CU price
-    if emergency and EMERGENCY_CU_PRICE_MICRO_LAMPORTS > 0:
-        payload["computeUnitPriceMicroLamports"] = EMERGENCY_CU_PRICE_MICRO_LAMPORTS
-    elif NORMAL_CU_PRICE_MICRO_LAMPORTS > 0:
-        payload["computeUnitPriceMicroLamports"] = NORMAL_CU_PRICE_MICRO_LAMPORTS
+
+    if emergency:
+        # v5.1: Dynamic slippage — Jupiter auto-calculates optimal per route
+        # Instead of blindly accepting 12%, Jupiter finds the minimum needed
+        max_bps_idx = min(retry_attempt, len(DYNAMIC_SLIPPAGE_MAX_BPS_BY_RETRY) - 1)
+        payload["dynamicSlippage"] = {
+            "minBps": DYNAMIC_SLIPPAGE_MIN_BPS,
+            "maxBps": DYNAMIC_SLIPPAGE_MAX_BPS_BY_RETRY[max_bps_idx],
+        }
+
+        # v5.1: Jito bundle tip — MEV-protected, no sandwich attacks
+        # Tip escalates with retries: 0.001 → 0.003 → 0.005 SOL
+        tip_idx = min(retry_attempt, len(JITO_TIP_LAMPORTS_BY_RETRY) - 1)
+        jito_tip = JITO_TIP_LAMPORTS_BY_RETRY[tip_idx]
+        payload["prioritizationFeeLamports"] = {
+            "jitoTipLamports": jito_tip,
+        }
+        print(f"[SWAP-TX] Emergency: Jito tip={jito_tip/1e9:.4f} SOL, "
+              f"dynamicSlippage max={DYNAMIC_SLIPPAGE_MAX_BPS_BY_RETRY[max_bps_idx]}bps")
     else:
-        payload["prioritizationFeeLamports"] = "auto"
+        # NORMAL mode: auto priority, no Jito
+        if NORMAL_CU_PRICE_MICRO_LAMPORTS > 0:
+            payload["computeUnitPriceMicroLamports"] = NORMAL_CU_PRICE_MICRO_LAMPORTS
+        else:
+            payload["prioritizationFeeLamports"] = "auto"
 
     headers = {"Content-Type": "application/json"}
     if jupiter_api_key:
@@ -1151,8 +1377,9 @@ def _jupiter_get_swap_tx(quote_response, user_public_key, jupiter_api_key=None,
 
 
 def _sign_and_send_tx(swap_response, keypair, emergency=False):
-    """Sign Jupiter swap transaction and send to Solana RPC.
-    emergency=True uses skipPreflight for faster inclusion."""
+    """Sign Jupiter swap transaction and send to Solana.
+    v5.1: emergency=True sends via Jito block engine for MEV protection,
+    with fallback to standard RPC if Jito fails."""
     if not SOLDERS_AVAILABLE:
         return None, "solders library not installed — cannot sign transactions"
     try:
@@ -1162,8 +1389,30 @@ def _sign_and_send_tx(swap_response, keypair, emergency=False):
         raw_tx = bytes(signed_tx)
         tx_b64 = base64.b64encode(raw_tx).decode("ascii")
 
-        # v4.1: Emergency mode = skipPreflight for speed
-        # In a rug everyone sells at once; skip preflight to submit faster
+        # v5.1: Emergency mode → try Jito block engine first (MEV protection)
+        # Jito bundles prevent sandwich attacks that would eat our slippage
+        if emergency:
+            try:
+                jito_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "sendTransaction",
+                    "params": [tx_b64, {"encoding": "base64"}],
+                }
+                jito_resp = http_requests.post(JITO_SEND_URL, json=jito_payload, timeout=15)
+                if jito_resp.status_code == 200:
+                    jito_result = jito_resp.json()
+                    if "result" in jito_result and jito_result["result"]:
+                        print(f"[JITO] Transaction sent via Jito block engine")
+                        return jito_result["result"], None
+                    elif "error" in jito_result:
+                        print(f"[JITO] Error: {str(jito_result['error'])[:100]}, falling back to RPC")
+                else:
+                    print(f"[JITO] HTTP {jito_resp.status_code}, falling back to RPC")
+            except Exception as e:
+                print(f"[JITO] Failed: {str(e)[:100]}, falling back to RPC")
+
+        # Standard RPC send (fallback, or NORMAL mode)
         send_opts = {
             "encoding": "base64",
             "skipPreflight": emergency,  # True in emergency for speed
@@ -1183,8 +1432,11 @@ def _sign_and_send_tx(swap_response, keypair, emergency=False):
 def _emergency_sell_with_retries(mint, keypair, public_key, balance,
                                  jupiter_api_key, slippage_bps, event_id=None):
     """
-    Emergency sell with priority fees + aggressive retries.
-    Each retry gets a fresh quote (= fresh blockhash) to avoid expiry.
+    v5.1: Emergency sell with Jito tips + dynamic slippage + escalating retries.
+    Each retry: fresh quote + higher Jito tip + wider slippage ceiling.
+    Retry 1: 0.001 SOL tip, 3% max dynamic slippage
+    Retry 2: 0.003 SOL tip, 8% max dynamic slippage
+    Retry 3: 0.005 SOL tip, 12% max dynamic slippage
     Returns result dict.
     """
     # v4.1: Idempotency — prevent duplicate emergency sells
@@ -1199,9 +1451,15 @@ def _emergency_sell_with_retries(mint, keypair, public_key, balance,
 
     for attempt in range(EMERGENCY_MAX_RETRIES):
         try:
+            # v5.1: Escalating Jito tips + dynamic slippage
+            tip_idx = min(attempt, len(JITO_TIP_LAMPORTS_BY_RETRY) - 1)
+            jito_tip = JITO_TIP_LAMPORTS_BY_RETRY[tip_idx]
+            max_bps_idx = min(attempt, len(DYNAMIC_SLIPPAGE_MAX_BPS_BY_RETRY) - 1)
+            max_slip = DYNAMIC_SLIPPAGE_MAX_BPS_BY_RETRY[max_bps_idx]
+
             print(f"[EMERGENCY-SELL] Attempt {attempt + 1}/{EMERGENCY_MAX_RETRIES} "
-                  f"for {mint[:12]}... (CU price: {EMERGENCY_CU_PRICE_MICRO_LAMPORTS} "
-                  f"micro-lamports, slippage: {slippage_bps}bps)")
+                  f"for {mint[:12]}... (Jito tip: {jito_tip/1e9:.4f} SOL, "
+                  f"dynamic slippage: {DYNAMIC_SLIPPAGE_MIN_BPS}-{max_slip}bps)")
 
             # Fresh quote each retry = fresh blockhash
             quote, err = _jupiter_get_quote(mint, SOL_MINT, balance, slippage_bps,
@@ -1212,14 +1470,20 @@ def _emergency_sell_with_retries(mint, keypair, public_key, balance,
                     time.sleep(EMERGENCY_RETRY_DELAYS[attempt])
                 continue
 
-            # Get swap tx with EMERGENCY priority fee bribe
+            # v5.1: Get swap tx with Jito tip + dynamic slippage (escalating)
             swap_resp, err = _jupiter_get_swap_tx(quote, public_key,
-                                                  jupiter_api_key, emergency=True)
+                                                  jupiter_api_key, emergency=True,
+                                                  retry_attempt=attempt)
             if err:
                 last_error = f"SwapTx attempt {attempt + 1}: {err}"
                 if attempt < EMERGENCY_MAX_RETRIES - 1:
                     time.sleep(EMERGENCY_RETRY_DELAYS[attempt])
                 continue
+
+            # v5.1: Extract dynamic slippage report if available
+            dynamic_report = swap_resp.get("dynamicSlippageReport", {})
+            actual_slippage = dynamic_report.get("slippageBps", slippage_bps)
+            simulated_slippage = dynamic_report.get("simulatedIncurredSlippageBps", "N/A")
 
             # Sign and send with skipPreflight=True for speed
             signature, err = _sign_and_send_tx(swap_resp, keypair, emergency=True)
@@ -1231,18 +1495,22 @@ def _emergency_sell_with_retries(mint, keypair, public_key, balance,
 
             # SUCCESS
             print(f"[EMERGENCY-SELL] SUCCESS on attempt {attempt + 1} — "
-                  f"{mint[:12]}... sig: {signature}")
+                  f"{mint[:12]}... sig: {signature} "
+                  f"(actual slippage: {actual_slippage}bps, "
+                  f"simulated: {simulated_slippage}bps, "
+                  f"Jito tip: {jito_tip/1e9:.4f} SOL)")
             return {
                 "success": True,
                 "signature": signature,
                 "tokens_sold": balance,
                 "input_mint": mint,
                 "output_mint": SOL_MINT,
-                "slippage_bps": slippage_bps,
+                "slippage_bps": actual_slippage,
+                "dynamic_slippage_report": dynamic_report,
                 "out_amount": quote.get("outAmount", "0"),
                 "price_impact": quote.get("priceImpactPct", "0"),
                 "priority": "EMERGENCY",
-                "cu_price_micro_lamports": EMERGENCY_CU_PRICE_MICRO_LAMPORTS,
+                "jito_tip_lamports": jito_tip,
                 "attempts": attempt + 1,
                 "event_id": event_id,
             }
@@ -1323,6 +1591,240 @@ def _auto_sell_position(mint, wallet_private_key_b58, jupiter_api_key,
             "priority": "NORMAL",
             "attempts": 1,
             "event_id": event_id,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Exception: {str(e)[:300]}"}
+
+
+def _auto_buy_token(mint, sol_lamports, wallet_private_key_b58, jupiter_api_key,
+                    slippage_bps=None, priority="NORMAL"):
+    """
+    Buy tokens with SOL via Jupiter. Mirrors _auto_sell_position() with reversed mints.
+    sol_lamports: amount of SOL to spend (in lamports, 1 SOL = 1_000_000_000)
+    Returns result dict with success/error, signature, tokens bought, etc.
+    """
+    if not SOLDERS_AVAILABLE:
+        return {"success": False, "error": "solders not installed"}
+
+    if slippage_bps is None:
+        slippage_bps = PUMP_BUY_SLIPPAGE_BPS
+
+    is_emergency = (priority == "EMERGENCY")
+
+    try:
+        keypair = SoldersKeypair.from_base58_string(wallet_private_key_b58)
+        public_key = str(keypair.pubkey())
+
+        # Check SOL balance first
+        bal_lamports, bal_err = _get_wallet_sol_balance(public_key)
+        if bal_err:
+            return {"success": False, "error": f"Balance check: {bal_err}"}
+
+        # Ensure enough SOL (leave 0.01 SOL for fees)
+        fee_buffer = 10_000_000  # 0.01 SOL
+        if bal_lamports < sol_lamports + fee_buffer:
+            return {
+                "success": False,
+                "error": f"Insufficient SOL: have {bal_lamports/1e9:.4f}, "
+                         f"need {sol_lamports/1e9:.4f} + 0.01 fees",
+                "balance_lamports": bal_lamports,
+            }
+
+        print(f"[AUTO-BUY] Buying {sol_lamports/1e9:.4f} SOL worth of {mint[:12]}... "
+              f"priority={priority} slippage={slippage_bps}bps")
+
+        # Quote: SOL_MINT -> mint (REVERSE of sell which is mint -> SOL_MINT)
+        quote, err = _jupiter_get_quote(SOL_MINT, mint, sol_lamports, slippage_bps,
+                                        jupiter_api_key)
+        if err:
+            return {"success": False, "error": f"Quote: {err}"}
+
+        # Get swap transaction
+        swap_resp, err = _jupiter_get_swap_tx(quote, public_key,
+                                              jupiter_api_key, emergency=is_emergency)
+        if err:
+            return {"success": False, "error": f"SwapTx: {err}"}
+
+        # Sign and send
+        signature, err = _sign_and_send_tx(swap_resp, keypair, emergency=is_emergency)
+        if err:
+            return {"success": False, "error": f"Send: {err}"}
+
+        out_amount = int(quote.get("outAmount", "0"))
+        print(f"[AUTO-BUY] SUCCESS — {mint[:12]}... bought, sig: {signature}, "
+              f"tokens_out: {out_amount}")
+
+        return {
+            "success": True,
+            "signature": signature,
+            "sol_spent_lamports": sol_lamports,
+            "tokens_received": out_amount,
+            "input_mint": SOL_MINT,
+            "output_mint": mint,
+            "slippage_bps": slippage_bps,
+            "price_impact": quote.get("priceImpactPct", "0"),
+            "priority": priority,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Exception: {str(e)[:300]}"}
+
+
+# ---------------------------------------------------------------------------
+# PumpPortal Bonding Curve Trading (v6.3)
+# ---------------------------------------------------------------------------
+
+def _pump_curve_get_tx(action, mint, amount, wallet_public_key,
+                       denominated_in_sol=True, slippage=25, priority_fee=0.002,
+                       pool="pump"):
+    """Get a serialized transaction from PumpPortal Local API.
+    Returns raw transaction bytes for signing, or (None, error)."""
+    payload = {
+        "publicKey": wallet_public_key,
+        "action": action,              # "buy" or "sell"
+        "mint": mint,
+        "amount": amount,              # SOL for buy, token amount or "100%" for sell
+        "denominatedInSol": "true" if denominated_in_sol else "false",
+        "slippage": slippage,
+        "priorityFee": priority_fee,
+        "pool": pool,
+    }
+    try:
+        resp = http_requests.post(PUMP_PORTAL_TRADE_URL, json=payload, timeout=15)
+        if resp.status_code != 200:
+            # Try to parse error from JSON or text
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get("error", err_data.get("message", resp.text[:200]))
+            except Exception:
+                err_msg = resp.text[:200]
+            return None, f"PumpPortal {resp.status_code}: {err_msg}"
+        if len(resp.content) < 100:
+            return None, f"PumpPortal: response too small ({len(resp.content)} bytes)"
+        return resp.content, None
+    except Exception as e:
+        return None, f"PumpPortal request failed: {str(e)[:200]}"
+
+
+def _pump_curve_sign_and_send(tx_bytes, keypair, use_jito=False):
+    """Sign PumpPortal transaction bytes and send to Solana.
+    Returns (signature, error)."""
+    if not SOLDERS_AVAILABLE:
+        return None, "solders library not installed"
+    try:
+        tx = SoldersVersionedTx.from_bytes(tx_bytes)
+        signed_tx = SoldersVersionedTx(tx.message, [keypair])
+        raw_tx = bytes(signed_tx)
+        tx_b64 = base64.b64encode(raw_tx).decode("ascii")
+
+        # Try Jito first for MEV protection (sells)
+        if use_jito:
+            try:
+                jito_payload = {
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "sendTransaction",
+                    "params": [tx_b64, {"encoding": "base64"}],
+                }
+                jito_resp = http_requests.post(JITO_SEND_URL, json=jito_payload, timeout=15)
+                if jito_resp.status_code == 200:
+                    jito_result = jito_resp.json()
+                    if "result" in jito_result and jito_result["result"]:
+                        print(f"[PUMP-CURVE] Sent via Jito")
+                        return jito_result["result"], None
+                    elif "error" in jito_result:
+                        print(f"[PUMP-CURVE] Jito error: {str(jito_result['error'])[:80]}, fallback to RPC")
+            except Exception as e:
+                print(f"[PUMP-CURVE] Jito failed: {str(e)[:80]}, fallback to RPC")
+
+        # Standard RPC
+        send_opts = {
+            "encoding": "base64",
+            "skipPreflight": True,
+            "preflightCommitment": "confirmed",
+        }
+        result = _rpc_call("sendTransaction", [tx_b64, send_opts], timeout=30)
+        if "error" in result:
+            return None, f"sendTransaction: {result.get('detail', result.get('error'))}"
+        return result.get("result"), None
+    except Exception as e:
+        return None, f"Sign/send failed: {str(e)[:300]}"
+
+
+def _pump_curve_buy(mint, sol_amount, wallet_private_key_b58):
+    """Buy tokens on pump.fun bonding curve via PumpPortal.
+    sol_amount: float SOL to spend.
+    Returns result dict with success/error, signature, etc."""
+    if not SOLDERS_AVAILABLE:
+        return {"success": False, "error": "solders not installed"}
+    try:
+        keypair = SoldersKeypair.from_base58_string(wallet_private_key_b58)
+        public_key = str(keypair.pubkey())
+
+        print(f"[PUMP-CURVE-BUY] {sol_amount:.4f} SOL → {mint[:12]}... "
+              f"slippage={PUMP_CURVE_BUY_SLIPPAGE}% fee={PUMP_CURVE_BUY_PRIORITY_FEE}")
+
+        # Single API call (vs Jupiter's 2-step quote+swap)
+        tx_bytes, err = _pump_curve_get_tx(
+            "buy", mint, sol_amount, public_key,
+            denominated_in_sol=True,
+            slippage=PUMP_CURVE_BUY_SLIPPAGE,
+            priority_fee=PUMP_CURVE_BUY_PRIORITY_FEE)
+        if err:
+            return {"success": False, "error": err}
+
+        signature, err = _pump_curve_sign_and_send(tx_bytes, keypair, use_jito=False)
+        if err:
+            return {"success": False, "error": err}
+
+        print(f"[PUMP-CURVE-BUY] SUCCESS — {mint[:12]}... sig: {signature}")
+        return {
+            "success": True,
+            "signature": signature,
+            "sol_spent_lamports": int(sol_amount * 1_000_000_000),
+            "tokens_received": 0,  # PumpPortal doesn't return this; we estimate from reserves
+            "input_mint": SOL_MINT,
+            "output_mint": mint,
+            "method": "pump_curve",
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Exception: {str(e)[:300]}"}
+
+
+def _pump_curve_sell(mint, token_amount, wallet_private_key_b58):
+    """Sell tokens on pump.fun bonding curve via PumpPortal.
+    token_amount: raw token amount to sell (or use string "100%" for all).
+    Returns result dict with success/error, signature, etc."""
+    if not SOLDERS_AVAILABLE:
+        return {"success": False, "error": "solders not installed"}
+    try:
+        keypair = SoldersKeypair.from_base58_string(wallet_private_key_b58)
+        public_key = str(keypair.pubkey())
+
+        # Use "100%" to sell all tokens
+        sell_amount = "100%"
+
+        print(f"[PUMP-CURVE-SELL] Selling 100% of {mint[:12]}... "
+              f"slippage={PUMP_CURVE_SELL_SLIPPAGE}% fee={PUMP_CURVE_SELL_PRIORITY_FEE}")
+
+        tx_bytes, err = _pump_curve_get_tx(
+            "sell", mint, sell_amount, public_key,
+            denominated_in_sol=False,
+            slippage=PUMP_CURVE_SELL_SLIPPAGE,
+            priority_fee=PUMP_CURVE_SELL_PRIORITY_FEE)
+        if err:
+            return {"success": False, "error": err}
+
+        signature, err = _pump_curve_sign_and_send(tx_bytes, keypair, use_jito=True)
+        if err:
+            return {"success": False, "error": err}
+
+        print(f"[PUMP-CURVE-SELL] SUCCESS — {mint[:12]}... sig: {signature}")
+        return {
+            "success": True,
+            "signature": signature,
+            "tokens_sold": token_amount,
+            "input_mint": mint,
+            "output_mint": SOL_MINT,
+            "method": "pump_curve",
         }
     except Exception as e:
         return {"success": False, "error": f"Exception: {str(e)[:300]}"}
@@ -1835,6 +2337,13 @@ def _poll_single_mint(mint):
                 _global_alerts.append(a)
 
     # ---- v4.1: AUTO-SELL CHECK (EMERGENCY PRIORITY) ----
+    # v6.0: Skip auto-sell for trading-engine-managed tokens (advisory only)
+    with _trading_managed_mints_lock:
+        if mint in _trading_managed_mints:
+            print(f"[SURVEILLANCE] Advisory alert for trading-managed {mint[:12]}... "
+                  f"severity={current_severity} — NOT selling (engine manages exits)")
+            return
+
     if (entry.get("auto_sell") and not already_sold and SOLDERS_AVAILABLE):
         threshold = entry.get("auto_sell_severity", AUTO_SELL_SEVERITY_THRESHOLD)
         threshold_val = SEVERITY_ORDER.get(threshold, 3)
@@ -1919,6 +2428,175 @@ def _stop_monitor_thread():
 
 
 # ---------------------------------------------------------------------------
+# v5.2 Helpers: Dust Filter + Stop-Loss
+# ---------------------------------------------------------------------------
+
+def _is_dust_token(mint, token_data, jupiter_api_key=None):
+    """
+    Two-stage dust filter. Returns (is_dust: bool, reason: str).
+    Stage 1 (instant): ui_amount < threshold → dust
+    Stage 2 (Jupiter quote): SOL value < threshold → dust
+    """
+    ui_amount = token_data.get("ui_amount", 0)
+    raw_amount = token_data.get("amount", 0)
+
+    # Stage 1: instant ui_amount check
+    if ui_amount < DUST_THRESHOLD_UI_AMOUNT:
+        return True, f"ui_amount={ui_amount} < {DUST_THRESHOLD_UI_AMOUNT}"
+
+    # Stage 2: Jupiter quote to check SOL value
+    if raw_amount <= 0:
+        return True, "zero raw balance"
+
+    try:
+        quote, err = _jupiter_get_quote(
+            mint, SOL_MINT, raw_amount, DUST_QUOTE_SLIPPAGE_BPS, jupiter_api_key)
+        if err or not quote:
+            # No liquidity = can't sell = dust
+            return True, f"no_quote: {err or 'empty response'}"
+
+        out_lamports = int(quote.get("outAmount", "0"))
+        sol_value = out_lamports / 1_000_000_000.0
+
+        if sol_value < DUST_THRESHOLD_SOL_VALUE:
+            return True, f"sol_value={sol_value:.6f} < {DUST_THRESHOLD_SOL_VALUE}"
+
+        return False, f"sol_value={sol_value:.6f} (above dust threshold)"
+    except Exception as e:
+        # Quote error = treat as dust (can't sell anyway)
+        return True, f"quote_error: {str(e)[:100]}"
+
+
+def _portfolio_get_sol_value(mint, raw_amount, jupiter_api_key=None):
+    """
+    Get current SOL value for a token position via Jupiter quote.
+    Returns (sol_value: float, out_lamports: int, error: str|None).
+    """
+    if raw_amount <= 0:
+        return 0.0, 0, "zero balance"
+
+    try:
+        quote, err = _jupiter_get_quote(
+            mint, SOL_MINT, raw_amount, STOP_LOSS_QUOTE_SLIPPAGE_BPS, jupiter_api_key)
+        if err or not quote:
+            return None, 0, err or "empty quote"
+
+        out_lamports = int(quote.get("outAmount", "0"))
+        sol_value = out_lamports / 1_000_000_000.0
+        return sol_value, out_lamports, None
+    except Exception as e:
+        return None, 0, f"quote_error: {str(e)[:200]}"
+
+
+def _portfolio_check_stop_losses(wallet_private_key, jupiter_api_key, stop_loss_pct):
+    """
+    Core stop-loss logic. Checks current SOL value of watched holdings,
+    triggers EMERGENCY sell if loss exceeds stop_loss_pct.
+    Called every STOP_LOSS_CHECK_INTERVAL_SCANS scans (~30s).
+    """
+    if stop_loss_pct <= 0:
+        return
+
+    # Collect candidates: actively-watched, not already sold, has entry_sol_value
+    candidates = []
+    with _portfolio_state_lock:
+        if not _portfolio_state or not _portfolio_state.get("active"):
+            return
+        for mint, holding in _portfolio_state.get("holdings", {}).items():
+            if holding.get("watch_status") not in ("watching", "pending"):
+                continue
+            if holding.get("stop_loss_triggered"):
+                continue
+            if holding.get("auto_sell_executed"):
+                continue
+            entry_val = holding.get("entry_sol_value")
+            if entry_val is None or entry_val <= 0:
+                continue
+            raw_amount = holding.get("amount", 0)
+            if raw_amount <= 0:
+                continue
+            candidates.append({
+                "mint": mint,
+                "entry_sol_value": entry_val,
+                "raw_amount": raw_amount,
+            })
+
+    if not candidates:
+        return
+
+    # Limit batch size to avoid hammering Jupiter
+    candidates = candidates[:STOP_LOSS_MAX_QUOTE_BATCH]
+
+    for cand in candidates:
+        if _portfolio_stop_event.is_set():
+            break
+
+        mint = cand["mint"]
+        entry_val = cand["entry_sol_value"]
+
+        # Get current SOL value
+        current_val, out_lamports, err = _portfolio_get_sol_value(
+            mint, cand["raw_amount"], jupiter_api_key)
+
+        if err or current_val is None:
+            print(f"[STOP-LOSS] Price check failed for {mint[:12]}...: {err}")
+            time.sleep(0.3)
+            continue
+
+        # Update current_sol_value in holdings
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with _portfolio_state_lock:
+            if _portfolio_state and mint in _portfolio_state.get("holdings", {}):
+                _portfolio_state["holdings"][mint]["current_sol_value"] = current_val
+                _portfolio_state["holdings"][mint]["last_price_check"] = now_iso
+
+        # Calculate loss percentage
+        if entry_val > 0:
+            loss_pct = ((entry_val - current_val) / entry_val) * 100.0
+        else:
+            loss_pct = 0.0
+
+        if loss_pct >= stop_loss_pct:
+            print(f"[STOP-LOSS] TRIGGERED for {mint[:12]}... "
+                  f"entry={entry_val:.6f} SOL → current={current_val:.6f} SOL "
+                  f"loss={loss_pct:.1f}% >= {stop_loss_pct}%")
+
+            _portfolio_add_event("STOP_LOSS_TRIGGERED", mint,
+                f"Stop-loss triggered: {loss_pct:.1f}% loss (threshold: {stop_loss_pct}%)",
+                {"entry_sol_value": entry_val, "current_sol_value": current_val,
+                 "loss_pct": round(loss_pct, 2), "threshold_pct": stop_loss_pct})
+
+            # Execute EMERGENCY sell
+            sell_result = _auto_sell_position(
+                mint, wallet_private_key, jupiter_api_key,
+                priority=STOP_LOSS_SELL_PRIORITY,
+                event_id=f"stop_loss_{mint[:16]}_{now_iso}")
+
+            _portfolio_add_event("STOP_LOSS_SELL", mint,
+                f"Stop-loss sell {'SUCCESS' if sell_result.get('success') else 'FAILED'}: "
+                f"{sell_result.get('signature', sell_result.get('error', 'unknown'))}",
+                sell_result)
+
+            # Update holding state
+            with _portfolio_state_lock:
+                if _portfolio_state and mint in _portfolio_state.get("holdings", {}):
+                    h = _portfolio_state["holdings"][mint]
+                    h["stop_loss_triggered"] = True
+                    h["stop_loss_result"] = sell_result
+                    if sell_result.get("success"):
+                        h["auto_sell_executed"] = True
+                        h["auto_sell_result"] = sell_result
+                        h["watch_status"] = "sold"
+        else:
+            pnl_str = f"+{-loss_pct:.1f}%" if loss_pct < 0 else f"-{loss_pct:.1f}%"
+            print(f"[STOP-LOSS] {mint[:12]}... PnL: {pnl_str} "
+                  f"(entry={entry_val:.6f} current={current_val:.6f})")
+
+        # Rate limit between quotes
+        time.sleep(0.3)
+
+
+# ---------------------------------------------------------------------------
 # Portfolio Auto-Pilot Scanner (v5.0)
 # ---------------------------------------------------------------------------
 def _portfolio_scan_loop():
@@ -1961,9 +2639,11 @@ def _portfolio_scan_loop():
                     _portfolio_state["scan_count"] = _portfolio_state.get("scan_count", 0) + 1
 
             # --- STEP 2: Detect NEW tokens ---
+            # v5.2: "dust" tokens are NOT re-detected (unless balance increases — see STEP 6)
             new_mints = []
             for mint, token_data in current_tokens.items():
-                if mint not in known_holdings or known_holdings[mint].get("watch_status") == "removed":
+                ws = known_holdings.get(mint, {}).get("watch_status")
+                if mint not in known_holdings or ws == "removed":
                     new_mints.append((mint, token_data))
 
             # --- STEP 3: Detect REMOVED tokens (balance -> 0 or gone from wallet) ---
@@ -1975,11 +2655,59 @@ def _portfolio_scan_loop():
                     removed_mints.append(mint)
 
             # --- STEP 4: Handle NEW tokens (staggered to avoid RPC spike) ---
+            # v5.2: Read stop_loss config for entry price recording
+            with _portfolio_state_lock:
+                _stop_loss_pct = _portfolio_state.get("stop_loss_pct", 0) if _portfolio_state else 0
+
             for mint, token_data in new_mints:
                 if _portfolio_stop_event.is_set():
                     break
 
                 now_iso = datetime.now(timezone.utc).isoformat()
+
+                # v6.0: Skip tokens managed by trading engine (don't interfere)
+                with _trading_managed_mints_lock:
+                    if mint in _trading_managed_mints:
+                        with _portfolio_state_lock:
+                            if _portfolio_state:
+                                _portfolio_state["holdings"][mint] = {
+                                    "amount": token_data["amount"],
+                                    "decimals": token_data["decimals"],
+                                    "ui_amount": token_data["ui_amount"],
+                                    "first_seen": now_iso,
+                                    "last_seen": now_iso,
+                                    "watch_status": "trading_engine",
+                                    "analysis_summary": None,
+                                    "auto_sell_executed": False,
+                                    "auto_sell_result": None,
+                                }
+                        continue
+
+                # v5.2: Dust token filter — skip worthless tokens
+                is_dust, dust_reason = _is_dust_token(mint, token_data, jupiter_api_key)
+                if is_dust:
+                    print(f"[PORTFOLIO] DUST SKIP: {mint[:12]}... reason={dust_reason}")
+                    _portfolio_add_event("DUST_SKIPPED", mint,
+                        f"Dust token skipped: {mint[:12]}... ({dust_reason})",
+                        {"ui_amount": token_data["ui_amount"], "amount": token_data["amount"],
+                         "reason": dust_reason})
+                    # Record as dust so it's not re-detected
+                    with _portfolio_state_lock:
+                        if _portfolio_state:
+                            _portfolio_state["holdings"][mint] = {
+                                "amount": token_data["amount"],
+                                "decimals": token_data["decimals"],
+                                "ui_amount": token_data["ui_amount"],
+                                "first_seen": now_iso,
+                                "last_seen": now_iso,
+                                "watch_status": "dust",
+                                "dust_reason": dust_reason,
+                                "analysis_summary": None,
+                                "auto_sell_executed": False,
+                                "auto_sell_result": None,
+                            }
+                    continue
+
                 _portfolio_add_event("NEW_TOKEN_DETECTED", mint,
                     f"New token detected: {mint[:12]}... amount={token_data['ui_amount']}",
                     {"amount": token_data["amount"], "ui_amount": token_data["ui_amount"],
@@ -1998,7 +2726,24 @@ def _portfolio_scan_loop():
                             "analysis_summary": None,
                             "auto_sell_executed": False,
                             "auto_sell_result": None,
+                            "entry_sol_value": None,
+                            "current_sol_value": None,
+                            "last_price_check": None,
+                            "stop_loss_triggered": False,
+                            "stop_loss_result": None,
                         }
+
+                # v5.2: Record entry SOL value for stop-loss tracking
+                if _stop_loss_pct > 0 and token_data["amount"] > 0:
+                    sol_val, _, sl_err = _portfolio_get_sol_value(
+                        mint, token_data["amount"], jupiter_api_key)
+                    if sol_val is not None:
+                        with _portfolio_state_lock:
+                            if _portfolio_state and mint in _portfolio_state.get("holdings", {}):
+                                _portfolio_state["holdings"][mint]["entry_sol_value"] = sol_val
+                        print(f"[STOP-LOSS] Entry price for {mint[:12]}...: {sol_val:.6f} SOL")
+                    else:
+                        print(f"[STOP-LOSS] Could not get entry price for {mint[:12]}...: {sl_err}")
 
                 # Run analysis for record-keeping
                 analysis = _portfolio_run_analysis(mint)
@@ -2047,6 +2792,21 @@ def _portfolio_scan_loop():
                     if _portfolio_state and mint in _portfolio_state.get("holdings", {}):
                         _portfolio_state["holdings"][mint]["watch_status"] = "removed"
 
+            # --- STEP 5.5: Stop-loss price checks (v5.2) ---
+            # Runs every STOP_LOSS_CHECK_INTERVAL_SCANS scans (~30s)
+            if _stop_loss_pct > 0:
+                with _portfolio_state_lock:
+                    _sl_counter = _portfolio_state.get("_stop_loss_scan_counter", 0) + 1 if _portfolio_state else 0
+                    if _portfolio_state:
+                        _portfolio_state["_stop_loss_scan_counter"] = _sl_counter
+
+                if _sl_counter >= STOP_LOSS_CHECK_INTERVAL_SCANS:
+                    with _portfolio_state_lock:
+                        if _portfolio_state:
+                            _portfolio_state["_stop_loss_scan_counter"] = 0
+                    print(f"[STOP-LOSS] Running price checks (every {STOP_LOSS_CHECK_INTERVAL_SCANS} scans)...")
+                    _portfolio_check_stop_losses(wallet_private_key, jupiter_api_key, _stop_loss_pct)
+
             # --- STEP 6: Update existing holdings balances + sync sell status ---
             # First: collect sell status from surveillance (avoid nested locks)
             sell_status = {}
@@ -2078,6 +2838,15 @@ def _portfolio_scan_loop():
                                 h["auto_sell_result"] = sell_status[mint]["result"]
                                 h["watch_status"] = "sold"
 
+                            # v5.2: Dust re-evaluation — if a "dust" token's balance
+                            # increased above threshold, re-detect it
+                            if h.get("watch_status") == "dust":
+                                if token_data["ui_amount"] >= DUST_THRESHOLD_UI_AMOUNT:
+                                    print(f"[PORTFOLIO] Dust token {mint[:12]}... "
+                                          f"balance increased to {token_data['ui_amount']} "
+                                          f"— re-evaluating")
+                                    h["watch_status"] = "removed"  # will re-detect in STEP 2
+
         except Exception as e:
             print(f"[PORTFOLIO] Scan loop error: {e}")
             with _portfolio_state_lock:
@@ -2105,6 +2874,1676 @@ def _stop_portfolio_thread():
     if _portfolio_thread:
         _portfolio_thread.join(timeout=1)
         _portfolio_thread = None
+
+
+# ---------------------------------------------------------------------------
+# Pump.fun Trading Engine (v6.0)
+# ---------------------------------------------------------------------------
+
+def _trading_add_event(event_type, mint, message, details=None):
+    """Append an event to the trading engine event log. Thread-safe."""
+    event = {
+        "type": event_type,
+        "mint": mint,
+        "message": message,
+        "details": details or {},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    with _trading_engine_lock:
+        if _trading_engine_state and "events" in _trading_engine_state:
+            _trading_engine_state["events"].append(event)
+    print(f"[TRADING] {event_type}: {message}")
+    return event
+
+
+# ---- Per-token state management ----
+
+def _trading_cleanup_stale_tokens():
+    """Remove tokens inactive for > PUMP_TOKEN_MAX_AGE. Must be called under _trading_token_states_lock."""
+    now = time.time()
+    stale = [
+        mint for mint, ts in _trading_token_states.items()
+        if (now - ts["last_trade_time"]) > PUMP_TOKEN_MAX_AGE
+        and not ts.get("position_taken")
+    ]
+    for mint in stale:
+        del _trading_token_states[mint]
+    if stale:
+        print(f"[TRADING] Cleaned up {len(stale)} stale tokens")
+
+
+def _trading_get_or_create_token(mint, trade_event=None):
+    """Get or create per-token state. Thread-safe. Optionally ingests a trade event."""
+    with _trading_token_states_lock:
+        if mint not in _trading_token_states:
+            # Enforce memory limit
+            if len(_trading_token_states) >= PUMP_MAX_TRACKED_TOKENS:
+                _trading_cleanup_stale_tokens()
+                if len(_trading_token_states) >= PUMP_MAX_TRACKED_TOKENS:
+                    return None  # still full after cleanup
+
+            now = time.time()
+            _trading_token_states[mint] = {
+                "mint": mint,
+                "first_seen": now,
+                "last_trade_time": now,
+                "trades": deque(maxlen=500),
+                "window_trades_count": 0,
+                "window_buy_count": 0,
+                "window_sell_count": 0,
+                "window_buy_volume_lamports": 0,
+                "window_sell_volume_lamports": 0,
+                "window_unique_wallets": set(),
+                "window_buy_ratio": 0.0,
+                "latest_virtual_sol_reserves": 0,
+                "latest_virtual_token_reserves": 0,
+                "initial_virtual_sol_reserves": 0,
+                "pump_score": 0.0,
+                "pump_score_history": deque(maxlen=30),
+                "score_components": {},
+                "subscribed": False,
+                "position_taken": False,
+                "market_cap_sol": 0,
+                # PNA v7.0 fields
+                "alpha_score": 0.0,
+                "alpha_components": {},
+                "early_life_trades": [],        # first N trades (for birth signature)
+                "early_life_analyzed": False,    # birth signature computed?
+                "early_life_signal": 0.0,        # organic=positive, scam=negative
+                "creator_wallet": None,          # pubkey of token creator
+                "creator_balance_history": [],   # [(time, newTokenBalance), ...]
+                "creator_selling": False,        # is creator dumping?
+                "smart_wallets_in": set(),        # smart wallets that bought this token
+                "reserve_snapshots": deque(maxlen=60),  # [(time, sol_reserves), ...] for pullback
+                "acceleration_phase": "unknown", # "accelerating", "decelerating", "stable", "unknown"
+            }
+
+        ts = _trading_token_states[mint]
+        if trade_event:
+            # Inject receive timestamp (API has no blockTime)
+            trade_event["_recv_time"] = time.time()
+            ts["trades"].append(trade_event)
+            ts["last_trade_time"] = time.time()
+            # Pump.fun API uses solInPool / tokensInPool (floats in SOL/tokens)
+            # Fallback to legacy field names for compatibility
+            vsr_f = float(trade_event.get("solInPool")
+                          or trade_event.get("vSolInBondingCurve")
+                          or trade_event.get("virtualSolReserves")
+                          or 0)
+            vtr_f = float(trade_event.get("tokensInPool")
+                          or trade_event.get("vTokensInBondingCurve")
+                          or trade_event.get("virtualTokenReserves")
+                          or 0)
+            # Store as float SOL (not lamports)
+            if vsr_f > 0:
+                ts["latest_virtual_sol_reserves"] = vsr_f
+                if ts["initial_virtual_sol_reserves"] == 0:
+                    ts["initial_virtual_sol_reserves"] = vsr_f
+            if vtr_f > 0:
+                ts["latest_virtual_token_reserves"] = vtr_f
+            # Store latest market cap if available (used for pre-bonding filter)
+            mcap = trade_event.get("marketCapSol")
+            if mcap is not None:
+                ts["market_cap_sol"] = float(mcap)
+
+        return ts
+
+
+def _trading_compute_window_metrics(token_state):
+    """Recompute sliding-window metrics from trades deque. Called every 5s.
+
+    Pump.fun WS trade event schema (actual):
+      txType: "buy" | "sell"    (NOT "trade"; no isBuy field)
+      solAmount: float (SOL)    (NOT int lamports)
+      traderPublicKey: str      (NOT "user")
+      solInPool: float (SOL)    (NOT "virtualSolReserves")
+      _recv_time: float         (injected at ingestion — API has no blockTime)
+    """
+    now = time.time()
+    window_start = now - PUMP_TRADE_WINDOW_SECONDS
+
+    buy_count = 0
+    sell_count = 0
+    buy_vol = 0.0
+    sell_vol = 0.0
+    wallets = set()
+
+    for t in token_state["trades"]:
+        # Use our injected receive timestamp (API provides no blockTime)
+        bt = float(t.get("_recv_time") or t.get("blockTime") or t.get("timestamp") or 0)
+        if bt < window_start:
+            continue
+        # solAmount is float SOL (e.g. 0.5 = 0.5 SOL)
+        sol_amount = float(t.get("solAmount") or 0)
+        user = t.get("traderPublicKey") or t.get("user") or ""
+        # txType is "buy"/"sell" — isBuy doesn't exist in the real API
+        tx_type = t.get("txType", "")
+        is_buy = (tx_type == "buy") if tx_type else t.get("isBuy", False)
+
+        if is_buy:
+            buy_count += 1
+            buy_vol += sol_amount
+        else:
+            sell_count += 1
+            sell_vol += sol_amount
+
+        if user:
+            wallets.add(user)
+
+    total = buy_count + sell_count
+    token_state["window_trades_count"] = total
+    token_state["window_buy_count"] = buy_count
+    token_state["window_sell_count"] = sell_count
+    # Store volume as SOL (float), not lamports — rename field
+    token_state["window_buy_volume_lamports"] = buy_vol
+    token_state["window_sell_volume_lamports"] = sell_vol
+    token_state["window_unique_wallets"] = wallets
+    token_state["window_buy_ratio"] = (buy_count / total) if total > 0 else 0.0
+
+
+# ---- Pump Score Computation ----
+
+def _trading_compute_pump_score(token_state):
+    """
+    Compute pump_score (0-100) from sliding-window metrics.
+    Weighted components:
+      - trade_velocity (25%): trades/min, cap 60
+      - buy_pressure (25%): buy_ratio * 100
+      - wallet_diversity (20%): unique wallets, cap 30
+      - volume_momentum (20%): total SOL volume, cap 10 SOL
+      - reserve_growth (10%): virtualSolReserves growth %
+    """
+    # Trade velocity
+    trades_per_min = token_state["window_trades_count"]  # window is 60s
+    velocity_score = min(100.0, (trades_per_min / 60.0) * 100.0)
+
+    # Buy pressure
+    pressure_score = token_state["window_buy_ratio"] * 100.0
+
+    # Wallet diversity
+    n_wallets = len(token_state["window_unique_wallets"])
+    diversity_score = min(100.0, (n_wallets / 30.0) * 100.0)
+
+    # Volume momentum (already in SOL — API sends float SOL not lamports)
+    total_vol_sol = (token_state["window_buy_volume_lamports"]
+                     + token_state["window_sell_volume_lamports"])
+    volume_score = min(100.0, (total_vol_sol / 10.0) * 100.0)
+
+    # Reserve growth
+    initial = token_state["initial_virtual_sol_reserves"]
+    current = token_state["latest_virtual_sol_reserves"]
+    if initial > 0 and current > initial:
+        growth_pct = ((current - initial) / initial) * 100.0
+        reserve_score = min(100.0, growth_pct * 2.0)
+    else:
+        reserve_score = 0.0
+
+    pump_score = (
+        velocity_score * 0.25 +
+        pressure_score * 0.25 +
+        diversity_score * 0.20 +
+        volume_score * 0.20 +
+        reserve_score * 0.10
+    )
+
+    components = {
+        "velocity": round(velocity_score, 1),
+        "buy_pressure": round(pressure_score, 1),
+        "wallet_diversity": round(diversity_score, 1),
+        "volume_momentum": round(volume_score, 1),
+        "reserve_growth": round(reserve_score, 1),
+    }
+
+    token_state["pump_score"] = round(pump_score, 2)
+    token_state["pump_score_history"].append((time.time(), pump_score))
+    token_state["score_components"] = components
+    return pump_score, components
+
+
+# ---- Predator Network Alpha (PNA) v7.0 ----
+
+def _pna_register_wallet_activity(wallet_pubkey, mint, is_buy, sol_amount):
+    """Record a wallet's activity for DNA profiling. Called on every trade event.
+    This is the foundation of the smart-money tracking system: we observe what
+    every wallet does across ALL tokens, building a reputation database with zero
+    additional API calls -- purely from WebSocket data we already receive."""
+    if not wallet_pubkey or len(wallet_pubkey) < 20:
+        return
+    now = time.time()
+    with _pna_wallet_dna_lock:
+        if wallet_pubkey not in _pna_wallet_dna:
+            # Enforce memory limit with LRU eviction
+            if len(_pna_wallet_dna) >= PNA_WALLET_MEMORY_MAX:
+                # Evict oldest 10% by last_seen
+                by_age = sorted(_pna_wallet_dna.items(), key=lambda x: x[1]["last_seen"])
+                evict_count = PNA_WALLET_MEMORY_MAX // 10
+                for k, _ in by_age[:evict_count]:
+                    del _pna_wallet_dna[k]
+
+            _pna_wallet_dna[wallet_pubkey] = {
+                "score": 0.0,               # reputation score (0-100)
+                "tokens_bought": {},         # mint -> {buy_time, sol_amount, entry_reserves}
+                "wins": 0,                   # count of profitable tokens
+                "losses": 0,                 # count of unprofitable tokens
+                "total_sol_wagered": 0.0,    # total SOL spent buying
+                "last_seen": now,
+                "first_seen": now,
+            }
+
+        dna = _pna_wallet_dna[wallet_pubkey]
+        dna["last_seen"] = now
+
+        if is_buy:
+            if mint not in dna["tokens_bought"]:
+                dna["tokens_bought"][mint] = {
+                    "buy_time": now,
+                    "sol_amount": sol_amount,
+                }
+            else:
+                dna["tokens_bought"][mint]["sol_amount"] += sol_amount
+            dna["total_sol_wagered"] += sol_amount
+
+        # Prune old token entries to prevent memory growth
+        if len(dna["tokens_bought"]) > 50:
+            by_time = sorted(dna["tokens_bought"].items(), key=lambda x: x[1]["buy_time"])
+            for k, _ in by_time[:20]:
+                del dna["tokens_bought"][k]
+
+
+def _pna_update_token_outcome(mint, current_reserves, initial_reserves):
+    """Track token outcomes for wallet DNA scoring. When a token pumps significantly,
+    all wallets that bought it early get their reputation boosted. This is the mechanism
+    that turns random wallet addresses into a 'smart money' signal: wallets that are
+    consistently early on winners get higher scores, and their future buys become
+    high-conviction entry signals."""
+    if initial_reserves <= 0 or current_reserves <= 0:
+        return
+    reserves_ratio = current_reserves / initial_reserves
+    now = time.time()
+
+    with _pna_token_outcomes_lock:
+        prev = _pna_token_outcomes.get(mint, {})
+        prev_peak = prev.get("peak_ratio", 0)
+
+        _pna_token_outcomes[mint] = {
+            "current_ratio": reserves_ratio,
+            "peak_ratio": max(reserves_ratio, prev_peak),
+            "last_updated": now,
+        }
+
+        # Only award wins when a new peak is reached that exceeds threshold
+        if reserves_ratio >= PNA_WALLET_MIN_PROFIT_MULT and reserves_ratio > prev_peak:
+            _pna_award_wallet_wins(mint, reserves_ratio)
+
+        # Evict old outcome data (older than 1 hour)
+        if len(_pna_token_outcomes) > 5000:
+            stale = [m for m, o in _pna_token_outcomes.items()
+                     if now - o["last_updated"] > PNA_WALLET_MEMORY_TTL]
+            for m in stale:
+                del _pna_token_outcomes[m]
+
+
+def _pna_award_wallet_wins(mint, reserves_ratio):
+    """Award reputation points to wallets that bought a token before it pumped.
+    The score increment is proportional to how much the token pumped (a 5x pump
+    awards more than a 1.5x pump). This creates a self-reinforcing signal:
+    the most profitable wallets accumulate the highest scores."""
+    score_boost = min(
+        PNA_WALLET_WIN_SCORE_PER_HIT * (reserves_ratio - 1.0),
+        PNA_WALLET_MAX_SCORE / 2  # single win can't exceed half max
+    )
+
+    with _pna_wallet_dna_lock:
+        for wallet_key, dna in _pna_wallet_dna.items():
+            if mint in dna["tokens_bought"]:
+                old_score = dna["score"]
+                dna["score"] = min(PNA_WALLET_MAX_SCORE, dna["score"] + score_boost)
+                dna["wins"] += 1
+                if dna["score"] != old_score:
+                    print(f"[PNA-DNA] Wallet {wallet_key[:12]}... score "
+                          f"{old_score:.1f}->{dna['score']:.1f} (win on {mint[:12]}... "
+                          f"ratio={reserves_ratio:.2f})")
+
+
+def _pna_decay_wallet_scores():
+    """Decay all wallet scores toward zero. Called periodically to ensure recency
+    bias: a wallet that was profitable 30 minutes ago matters more than one
+    profitable 55 minutes ago. Without decay, stale reputations accumulate
+    and the signal degrades."""
+    now = time.time()
+    with _pna_wallet_dna_lock:
+        stale_wallets = []
+        for wallet_key, dna in _pna_wallet_dna.items():
+            # Decay score
+            dna["score"] *= PNA_WALLET_WIN_SCORE_DECAY
+            if dna["score"] < 0.5:
+                dna["score"] = 0.0
+            # Mark for eviction if dormant
+            if now - dna["last_seen"] > PNA_WALLET_MEMORY_TTL:
+                stale_wallets.append(wallet_key)
+        for w in stale_wallets:
+            del _pna_wallet_dna[w]
+
+
+def _pna_get_smart_wallets_on_token(token_state):
+    """Return set of smart wallets that have bought this token, and the aggregate
+    smart money score. A 'smart wallet' is one whose DNA score exceeds the
+    PNA_SMART_MONEY_THRESHOLD -- meaning it has a proven track record of being
+    early on profitable tokens."""
+    smart_wallets = set()
+    total_smart_score = 0.0
+
+    with _pna_wallet_dna_lock:
+        for trade in token_state.get("trades", []):
+            tx_type = trade.get("txType", "")
+            if tx_type != "buy":
+                continue
+            wallet = trade.get("traderPublicKey", "")
+            if not wallet:
+                continue
+            dna = _pna_wallet_dna.get(wallet)
+            if dna and dna["score"] >= PNA_SMART_MONEY_THRESHOLD:
+                smart_wallets.add(wallet)
+                total_smart_score += dna["score"]
+
+    return smart_wallets, total_smart_score
+
+
+def _pna_compute_smart_money_signal(token_state):
+    """Compute the smart money component of the alpha score.
+    This is the primary edge: when multiple wallets with high DNA scores
+    converge on a single token, it is a high-conviction signal that
+    something real is happening. No other bot is tracking this because
+    it requires cross-token memory that persists across the WebSocket stream."""
+    smart_wallets, total_score = _pna_get_smart_wallets_on_token(token_state)
+    token_state["smart_wallets_in"] = smart_wallets
+    n_smart = len(smart_wallets)
+
+    if n_smart < PNA_SMART_MONEY_MIN_WALLETS:
+        return 0.0
+
+    # Score scales with number of smart wallets and their aggregate reputation
+    # Having 3 smart wallets with scores 60, 50, 45 is a much stronger signal
+    # than having 2 smart wallets with scores 41, 41
+    avg_score = total_score / n_smart if n_smart > 0 else 0
+    # Normalized: how many smart wallets (scaled to 0-1 where 5+ = max)
+    wallet_factor = min(1.0, n_smart / 5.0)
+    # How strong their reputations are (scaled 0-1)
+    score_factor = min(1.0, avg_score / PNA_WALLET_MAX_SCORE)
+    # Combine: both factors matter
+    raw_signal = (wallet_factor * 0.6 + score_factor * 0.4) * PNA_SMART_MONEY_MAX_BOOST
+
+    return min(raw_signal, PNA_SMART_MONEY_MAX_BOOST)
+
+
+def _pna_compute_early_life_signal(token_state):
+    """Analyze the 'birth signature' of a token from its first N trades.
+    The hypothesis: organic tokens have diverse, moderate-sized early buys from
+    unrelated wallets. Scam/bot tokens have concentrated buys from few wallets
+    (the dev generating fake volume) or extreme dust buys (airdrop wash).
+
+    This signal is computed ONCE per token (when it reaches N trades) and cached.
+    It acts as a quality filter: tokens born from organic interest get a bonus,
+    tokens born from manipulation get a penalty that makes them nearly impossible
+    to enter."""
+    if token_state.get("early_life_analyzed"):
+        return token_state.get("early_life_signal", 0.0)
+
+    trades = list(token_state.get("trades", []))
+    if len(trades) < PNA_EARLY_TRADE_WINDOW:
+        return 0.0  # not enough data yet
+
+    # Analyze first N trades only
+    early_trades = trades[:PNA_EARLY_TRADE_WINDOW]
+    token_state["early_life_analyzed"] = True
+
+    # Count wallet frequency
+    wallet_counts = {}
+    sol_amounts = []
+    buy_count = 0
+    for t in early_trades:
+        wallet = t.get("traderPublicKey", "")
+        tx_type = t.get("txType", "")
+        sol_amt = float(t.get("solAmount") or 0)
+        if wallet:
+            wallet_counts[wallet] = wallet_counts.get(wallet, 0) + 1
+        if tx_type == "buy":
+            buy_count += 1
+            sol_amounts.append(sol_amt)
+
+    n_distinct = len(wallet_counts)
+    total_early = len(early_trades)
+
+    # CHECK 1: Wallet concentration — is one wallet dominating early trades?
+    max_wallet_trades = max(wallet_counts.values()) if wallet_counts else 0
+    max_wallet_pct = max_wallet_trades / total_early if total_early > 0 else 0
+    if max_wallet_pct > PNA_EARLY_MAX_SAME_WALLET_PCT:
+        signal = PNA_EARLY_SCAM_PENALTY
+        token_state["early_life_signal"] = signal
+        return signal
+
+    # CHECK 2: Wallet diversity — too few distinct wallets?
+    if n_distinct < PNA_EARLY_MIN_DISTINCT_WALLETS:
+        signal = PNA_EARLY_SCAM_PENALTY * 0.5  # less severe than single-wallet domination
+        token_state["early_life_signal"] = signal
+        return signal
+
+    # CHECK 3: Buy size distribution — moderate buys = organic
+    if sol_amounts:
+        avg_sol = sum(sol_amounts) / len(sol_amounts)
+        in_range_count = sum(1 for s in sol_amounts
+                            if PNA_EARLY_IDEAL_SOL_PER_TRADE_MIN <= s <= PNA_EARLY_IDEAL_SOL_PER_TRADE_MAX)
+        moderate_ratio = in_range_count / len(sol_amounts) if sol_amounts else 0
+    else:
+        avg_sol = 0
+        moderate_ratio = 0
+
+    # CHECK 4: Early buy ratio — mostly buys = organic interest
+    early_buy_ratio = buy_count / total_early if total_early > 0 else 0
+
+    # Compute organic signal
+    diversity_factor = min(1.0, n_distinct / (PNA_EARLY_TRADE_WINDOW * 0.6))
+    moderate_factor = moderate_ratio
+    buy_ratio_factor = min(1.0, early_buy_ratio / 0.8)  # 80%+ buys = full score
+
+    signal = PNA_EARLY_ORGANIC_BONUS * (
+        diversity_factor * 0.4 +
+        moderate_factor * 0.3 +
+        buy_ratio_factor * 0.3
+    )
+
+    token_state["early_life_signal"] = round(signal, 2)
+    return signal
+
+
+def _pna_compute_acceleration(token_state):
+    """Compute momentum ACCELERATION by splitting the trade window into sub-windows
+    and measuring the rate of change of trade frequency.
+
+    Instead of asking 'how many trades per minute?' (which everybody does),
+    this asks 'is the rate INCREASING or DECREASING?' This is the derivative
+    of the velocity signal, and it is predictive rather than descriptive:
+    - Acceleration = early pump, enter now
+    - Constant velocity = mid-pump, risky
+    - Deceleration = late pump / dying, do NOT enter
+
+    Sub-window counts: [W0=oldest, W1, W2, W3=newest]
+    Acceleration if W3 > W2 > W1 > W0 (each by threshold factor)
+    Deceleration if W3 < W2 < W1 < W0"""
+    now = time.time()
+    sub_window_sec = PNA_ACCEL_SUB_WINDOW_SEC
+    n_windows = PNA_ACCEL_SUB_WINDOWS
+    total_window = sub_window_sec * n_windows
+
+    # Count trades in each sub-window
+    window_counts = [0] * n_windows
+    for t in token_state.get("trades", []):
+        bt = float(t.get("_recv_time") or 0)
+        if bt <= 0:
+            continue
+        age = now - bt
+        if age > total_window or age < 0:
+            continue
+        # Which sub-window? 0=oldest, n-1=newest
+        idx = int((total_window - age) / sub_window_sec)
+        idx = min(idx, n_windows - 1)
+        window_counts[idx] = window_counts.get(idx, 0) + 1 if isinstance(window_counts, dict) else window_counts[idx] + 1
+
+    # Measure acceleration: how many consecutive windows show growth?
+    accel_count = 0
+    decel_count = 0
+    for i in range(1, n_windows):
+        prev = window_counts[i - 1]
+        curr = window_counts[i]
+        if prev == 0:
+            if curr > 0:
+                accel_count += 1
+            continue
+        ratio = curr / prev
+        if ratio >= PNA_ACCEL_EXPONENTIAL_THRESHOLD:
+            accel_count += 1
+        elif ratio <= (1.0 / PNA_ACCEL_EXPONENTIAL_THRESHOLD):
+            decel_count += 1
+
+    # Compute signal
+    if accel_count >= 2:
+        signal = min(accel_count * PNA_ACCEL_BONUS_PER_WINDOW, PNA_ACCEL_MAX_BONUS)
+        token_state["acceleration_phase"] = "accelerating"
+    elif decel_count >= 2:
+        signal = max(decel_count * PNA_DECEL_PENALTY_PER_WINDOW, PNA_ACCEL_MAX_PENALTY)
+        token_state["acceleration_phase"] = "decelerating"
+    else:
+        signal = 0.0
+        token_state["acceleration_phase"] = "stable"
+
+    return signal, window_counts
+
+
+def _pna_compute_creator_signal(token_state):
+    """Analyze whether the token creator is still holding or has started selling.
+    The creator wallet is known from the 'create' event that we capture when a new
+    token appears on the WebSocket. If the creator is selling (their newTokenBalance
+    is decreasing across trades), this is the strongest single rug indicator.
+
+    Most bots don't track this because they don't correlate the 'create' event's
+    wallet with subsequent trade events' traderPublicKey. We do."""
+    creator = token_state.get("creator_wallet")
+    if not creator:
+        return 0.0
+
+    # Scan trades for creator activity
+    creator_buys = 0
+    creator_sells = 0
+    creator_balances = []
+
+    for t in token_state.get("trades", []):
+        wallet = t.get("traderPublicKey", "")
+        if wallet != creator:
+            continue
+        tx_type = t.get("txType", "")
+        new_balance = t.get("newTokenBalance")
+        recv_time = float(t.get("_recv_time") or 0)
+
+        if tx_type == "buy":
+            creator_buys += 1
+        elif tx_type == "sell":
+            creator_sells += 1
+
+        if new_balance is not None and recv_time > 0:
+            creator_balances.append((recv_time, float(new_balance)))
+
+    # No creator activity seen yet
+    if creator_buys == 0 and creator_sells == 0:
+        # Creator hasn't traded — neutral (they might have pre-mined)
+        return PNA_CREATOR_HOLDING_BONUS * 0.3  # small bonus for not selling
+
+    # Creator is selling
+    if creator_sells > 0:
+        # Check magnitude: how much have they sold?
+        if len(creator_balances) >= 2:
+            creator_balances.sort(key=lambda x: x[0])
+            peak_balance = max(b for _, b in creator_balances)
+            latest_balance = creator_balances[-1][1]
+            if peak_balance > 0:
+                sold_pct = ((peak_balance - latest_balance) / peak_balance) * 100
+                if sold_pct >= PNA_CREATOR_DUMP_THRESHOLD_PCT:
+                    token_state["creator_selling"] = True
+                    return PNA_CREATOR_SELLING_PENALTY
+                else:
+                    # Small sells — mild penalty
+                    return PNA_CREATOR_SELLING_PENALTY * (sold_pct / PNA_CREATOR_DUMP_THRESHOLD_PCT)
+
+        token_state["creator_selling"] = True
+        return PNA_CREATOR_SELLING_PENALTY * 0.5
+
+    # Creator only buying more — very bullish
+    if creator_buys > 0 and creator_sells == 0:
+        return PNA_CREATOR_HOLDING_BONUS
+
+    return 0.0
+
+
+def _pna_blacklist_creator(creator_pubkey, mint):
+    """v7.2 INVENTION 3: Add a creator to the blacklist when they dump a token.
+    Cross-token creator reputation — if a creator dumped token A, NEVER buy their token B.
+    This is a signal no other bot tracks because it requires correlating create events
+    with trade events across multiple tokens over time."""
+    if not creator_pubkey:
+        return
+    with _pna_creator_blacklist_lock:
+        if creator_pubkey not in _pna_creator_blacklist:
+            _pna_creator_blacklist[creator_pubkey] = {
+                "dumps": 0, "last_dump_time": 0, "tokens_dumped": []
+            }
+        bl = _pna_creator_blacklist[creator_pubkey]
+        if mint not in bl["tokens_dumped"]:
+            bl["dumps"] += 1
+            bl["last_dump_time"] = time.time()
+            bl["tokens_dumped"].append(mint)
+            if len(bl["tokens_dumped"]) > 20:
+                bl["tokens_dumped"] = bl["tokens_dumped"][-20:]
+            print(f"[PNA-BLACKLIST] Creator {creator_pubkey[:12]}... blacklisted "
+                  f"(dumped {bl['dumps']} tokens, latest: {mint[:12]}...)")
+        # Enforce max size
+        if len(_pna_creator_blacklist) > CREATOR_BLACKLIST_MAX_SIZE:
+            oldest = sorted(_pna_creator_blacklist.items(),
+                           key=lambda x: x[1]["last_dump_time"])
+            for k, _ in oldest[:500]:
+                del _pna_creator_blacklist[k]
+
+
+def _pna_is_creator_blacklisted(mint):
+    """Check if a token's creator is on the blacklist."""
+    creator = None
+    with _pna_creator_wallets_lock:
+        creator = _pna_creator_wallets.get(mint)
+    if not creator:
+        return False
+    with _pna_creator_blacklist_lock:
+        bl = _pna_creator_blacklist.get(creator)
+        if bl and bl["dumps"] >= CREATOR_BLACKLIST_DUMP_THRESHOLD:
+            return True
+    return False
+
+
+def _pna_compute_graduation_signal(token_state):
+    """Compute proximity to bonding curve graduation.
+    Tokens near the ~85 SOL market cap graduation threshold have a catalyst:
+    graduation to Raydium means a flood of new liquidity, DEX listing visibility,
+    and new buyer attention. Entering just before graduation captures this catalyst.
+
+    We use the market_cap_sol field from the trade events, which is free real-time
+    data that tells us exactly where the token is on the bonding curve."""
+    mcap = token_state.get("market_cap_sol", 0)
+    if mcap <= 0:
+        return 0.0
+
+    # Distance from graduation threshold
+    distance = PNA_GRADUATION_MCAP_SOL - mcap
+    if distance < 0:
+        # Already graduated or past threshold — no bonus (might be overbought)
+        return 0.0
+    if distance > PNA_GRADUATION_PROXIMITY_RANGE:
+        # Too far from graduation — no bonus yet
+        return 0.0
+
+    # Closer = stronger signal (linear ramp)
+    proximity_factor = 1.0 - (distance / PNA_GRADUATION_PROXIMITY_RANGE)
+    return PNA_GRADUATION_BONUS * proximity_factor
+
+
+def _pna_compute_pullback_signal(token_state):
+    """Detect 'buy the dip' opportunities: a brief price pullback during an
+    otherwise healthy pump, followed by resumed buying.
+
+    The key insight: most retail bots only buy when everything is green (high velocity,
+    high buy ratio). But the best entries are during brief red candles within a trend,
+    because weak hands are panic selling to you at a discount and the smart money
+    hasn't exited.
+
+    We detect this by tracking reserve snapshots: if reserves drop 15%+ then recover 5%+,
+    AND the buy ratio is recovering, we have a pullback entry signal."""
+    snapshots = list(token_state.get("reserve_snapshots", []))
+    if len(snapshots) < 5:
+        return 0.0
+
+    # Find peak reserves
+    peak_reserves = max(s[1] for s in snapshots)
+    if peak_reserves <= 0:
+        return 0.0
+
+    # Find the dip (minimum reserves after peak)
+    peak_idx = next(i for i, s in enumerate(snapshots) if s[1] == peak_reserves)
+    post_peak = snapshots[peak_idx:]
+    if len(post_peak) < 3:
+        return 0.0
+
+    min_after_peak = min(s[1] for s in post_peak)
+    dip_pct = (peak_reserves - min_after_peak) / peak_reserves
+
+    if dip_pct < PNA_PULLBACK_DIP_THRESHOLD:
+        return 0.0  # not a significant dip
+
+    # Check recovery: are reserves recovering from the dip?
+    latest_reserves = snapshots[-1][1]
+    recovery_from_dip = (latest_reserves - min_after_peak) / peak_reserves if peak_reserves > 0 else 0
+
+    if recovery_from_dip < PNA_PULLBACK_RECOVERY_THRESHOLD:
+        return 0.0  # not recovering yet
+
+    # Check buy ratio is also recovering (not just reserves)
+    buy_ratio = token_state.get("window_buy_ratio", 0)
+    if buy_ratio < 0.55:
+        return 0.0  # still more sellers than buyers
+
+    return PNA_PULLBACK_BONUS
+
+
+def _pna_take_reserve_snapshot(token_state):
+    """Record current reserves for pullback detection. Called every eval cycle."""
+    current_reserves = token_state.get("latest_virtual_sol_reserves", 0)
+    if current_reserves > 0:
+        token_state["reserve_snapshots"].append((time.time(), current_reserves))
+
+
+def _pna_compute_alpha_score(token_state):
+    """Compute the composite Predator Network Alpha score (0-100).
+
+    This REPLACES the old pump_score as the primary entry signal. While pump_score
+    measures what has already happened (lagging), alpha_score measures predictive
+    signals:
+
+    1. Smart Money (30%): Are proven-profitable wallets buying this token?
+    2. Acceleration (25%): Is trade velocity increasing or decreasing?
+    3. Early Life (15%): Was this token born organically or from manipulation?
+    4. Creator (10%): Is the creator holding or dumping?
+    5. Graduation (10%): Is this token about to graduate to Raydium?
+    6. Pullback (10%): Is this a pullback entry within a healthy trend?
+
+    The weights are tuned so that smart money is the dominant signal (it is the
+    hardest to fake and the most predictive), with acceleration as the secondary
+    signal (it is the most time-sensitive). The remaining signals act as filters
+    to avoid scams and identify catalysts.
+
+    Why this gives an edge:
+    - Smart money tracking requires cross-token memory that resets on restart,
+      so only persistent bots can build it. We accumulate it from the WebSocket
+      stream over the session lifetime.
+    - Acceleration is a derivative signal that most bots don't compute.
+    - Creator tracking correlates create events with trade events, which requires
+      maintaining state that most stateless bots discard.
+    - The pullback signal is counter-intuitive (buy when price dips) and goes
+      against the herd behavior of all pump_score-style bots.
+    """
+    # Component 1: Smart Money
+    smart_money_raw = _pna_compute_smart_money_signal(token_state)
+
+    # Component 2: Acceleration
+    accel_raw, window_counts = _pna_compute_acceleration(token_state)
+
+    # Component 3: Early Life Signature
+    early_life_raw = _pna_compute_early_life_signal(token_state)
+
+    # Component 4: Creator Behavior
+    creator_raw = _pna_compute_creator_signal(token_state)
+
+    # Component 5: Graduation Proximity
+    graduation_raw = _pna_compute_graduation_signal(token_state)
+
+    # Component 6: Pullback Detection
+    pullback_raw = _pna_compute_pullback_signal(token_state)
+
+    # Take reserve snapshot for future pullback analysis
+    _pna_take_reserve_snapshot(token_state)
+
+    # Normalize all components to 0-100 scale
+    # Smart money: already 0-40, scale to 0-100
+    # v7.2c: Check QUALIFIED smart wallets count, not total DNA size.
+    # Total wallets can grow past 500 while smart_wallets stays at 0 (if none qualified yet).
+    # When we have fewer than 10 qualified smart wallets, give baseline 50 (neutral).
+    smart_wallet_count = 0
+    with _pna_wallet_dna_lock:
+        for w_dna in _pna_wallet_dna.values():
+            if w_dna.get("score", 0) >= PNA_SMART_MONEY_THRESHOLD:
+                smart_wallet_count += 1
+                if smart_wallet_count >= 10:
+                    break
+    if smart_wallet_count < 10:
+        # Warmup phase: smart money contributes neutral (50) instead of 0
+        smart_money_norm = max(50.0, min(100.0, (smart_money_raw / PNA_SMART_MONEY_MAX_BOOST) * 100.0)) if PNA_SMART_MONEY_MAX_BOOST > 0 else 50.0
+    else:
+        smart_money_norm = min(100.0, (smart_money_raw / PNA_SMART_MONEY_MAX_BOOST) * 100.0) if PNA_SMART_MONEY_MAX_BOOST > 0 else 0
+    # Acceleration: range is -30 to +25, map to 0-100 (50 = neutral)
+    accel_norm = max(0, min(100.0, 50.0 + (accel_raw / PNA_ACCEL_MAX_BONUS) * 50.0)) if PNA_ACCEL_MAX_BONUS > 0 else 50.0
+    # Early life: range is -30 to +15, map to 0-100 (50 = neutral, skewed positive for organic)
+    if early_life_raw >= 0:
+        early_life_norm = 50.0 + (early_life_raw / PNA_EARLY_ORGANIC_BONUS) * 50.0 if PNA_EARLY_ORGANIC_BONUS > 0 else 50.0
+    else:
+        early_life_norm = max(0, 50.0 + (early_life_raw / abs(PNA_EARLY_SCAM_PENALTY)) * 50.0) if PNA_EARLY_SCAM_PENALTY != 0 else 50.0
+    # Creator: range is -25 to +10, map to 0-100
+    if creator_raw >= 0:
+        creator_norm = 50.0 + (creator_raw / PNA_CREATOR_HOLDING_BONUS) * 50.0 if PNA_CREATOR_HOLDING_BONUS > 0 else 50.0
+    else:
+        creator_norm = max(0, 50.0 + (creator_raw / abs(PNA_CREATOR_SELLING_PENALTY)) * 50.0) if PNA_CREATOR_SELLING_PENALTY != 0 else 50.0
+    # Graduation: 0-12, map to 0-100
+    graduation_norm = min(100.0, (graduation_raw / PNA_GRADUATION_BONUS) * 100.0) if PNA_GRADUATION_BONUS > 0 else 0
+    # Pullback: 0 or 10, map to 0-100
+    pullback_norm = min(100.0, (pullback_raw / PNA_PULLBACK_BONUS) * 100.0) if PNA_PULLBACK_BONUS > 0 else 0
+
+    # Weighted composite
+    alpha_score = (
+        smart_money_norm * PNA_WEIGHT_SMART_MONEY +
+        accel_norm * PNA_WEIGHT_ACCELERATION +
+        early_life_norm * PNA_WEIGHT_EARLY_LIFE +
+        creator_norm * PNA_WEIGHT_CREATOR +
+        graduation_norm * PNA_WEIGHT_GRADUATION +
+        pullback_norm * PNA_WEIGHT_PULLBACK
+    )
+
+    # Clamp to 0-100
+    alpha_score = max(0.0, min(100.0, alpha_score))
+
+    # Hard veto: if creator is actively dumping, cap alpha at 30 regardless
+    if token_state.get("creator_selling"):
+        alpha_score = min(alpha_score, 30.0)
+
+    # Hard veto: if early life detected scam pattern, cap at 25
+    if early_life_raw <= PNA_EARLY_SCAM_PENALTY * 0.8:
+        alpha_score = min(alpha_score, 25.0)
+
+    # Hard veto: if decelerating, cap at 40 (don't buy dying pumps)
+    if token_state.get("acceleration_phase") == "decelerating":
+        alpha_score = min(alpha_score, 40.0)
+
+    components = {
+        "smart_money": round(smart_money_norm, 1),
+        "smart_money_raw": round(smart_money_raw, 2),
+        "smart_wallets_count": len(token_state.get("smart_wallets_in", set())),
+        "acceleration": round(accel_norm, 1),
+        "acceleration_phase": token_state.get("acceleration_phase", "unknown"),
+        "accel_windows": window_counts,
+        "early_life": round(early_life_norm, 1),
+        "early_life_raw": round(early_life_raw, 2),
+        "creator": round(creator_norm, 1),
+        "creator_selling": token_state.get("creator_selling", False),
+        "graduation": round(graduation_norm, 1),
+        "graduation_mcap": token_state.get("market_cap_sol", 0),
+        "pullback": round(pullback_norm, 1),
+    }
+
+    token_state["alpha_score"] = round(alpha_score, 2)
+    token_state["alpha_components"] = components
+    return alpha_score, components
+
+
+# ---- WebSocket Consumer Thread ----
+
+def _trading_handle_new_token(ws, data):
+    """Handle new token creation event from pump.fun. Subscribe to its trades.
+    v7.0: Also capture the creator wallet for PNA creator behavior analysis."""
+    mint = data.get("mint", "")
+    if not mint:
+        return
+
+    with _trading_engine_lock:
+        if not _trading_engine_state or not _trading_engine_state.get("active"):
+            return
+        _trading_engine_state["stats"]["tokens_seen"] = \
+            _trading_engine_state["stats"].get("tokens_seen", 0) + 1
+
+    ts = _trading_get_or_create_token(mint)
+    if ts is None:
+        return  # at capacity
+
+    # PNA v7.0: Capture creator wallet from the create event
+    creator = data.get("traderPublicKey") or data.get("creator") or ""
+    if creator:
+        with _pna_creator_wallets_lock:
+            _pna_creator_wallets[mint] = creator
+        with _trading_token_states_lock:
+            if mint in _trading_token_states:
+                _trading_token_states[mint]["creator_wallet"] = creator
+
+    try:
+        ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+        with _trading_token_states_lock:
+            if mint in _trading_token_states:
+                _trading_token_states[mint]["subscribed"] = True
+    except Exception as e:
+        print(f"[TRADING-WS] Subscribe failed for {mint[:12]}...: {e}")
+
+
+def _trading_handle_trade(data):
+    """Handle trade event. Accumulate into per-token state.
+    v6.3: Inline recompute metrics + score for speed (scores always fresh).
+    v7.0: Register wallet DNA activity for PNA smart money tracking."""
+    mint = data.get("mint", "")
+    if not mint:
+        return
+
+    # PNA v7.0: Register wallet activity for DNA profiling (every trade, cross-token)
+    wallet = data.get("traderPublicKey", "")
+    tx_type = data.get("txType", "")
+    sol_amount = float(data.get("solAmount") or 0)
+    is_buy = (tx_type == "buy")
+    if wallet:
+        _pna_register_wallet_activity(wallet, mint, is_buy, sol_amount)
+
+    ts = _trading_get_or_create_token(mint, trade_event=data)
+    # v6.3: Recompute score inline so eval loop sees fresh data instantly
+    if ts and len(ts.get("trades", [])) >= 5:
+        try:
+            _trading_compute_window_metrics(ts)
+            _trading_compute_pump_score(ts)
+        except Exception:
+            pass  # non-critical — eval loop will recompute anyway
+
+    # PNA v7.0: Update token outcome for wallet win tracking
+    if ts:
+        try:
+            _pna_update_token_outcome(
+                mint,
+                ts.get("latest_virtual_sol_reserves", 0),
+                ts.get("initial_virtual_sol_reserves", 0)
+            )
+        except Exception:
+            pass
+
+
+def _trading_ws_thread():
+    """Daemon thread: connect to pump.fun WebSocket, ingest trade events.
+    Reconnects with exponential backoff on disconnect."""
+    global _trading_ws_app_ref
+    reconnect_delay = PUMP_WS_RECONNECT_DELAY
+
+    while not _trading_stop_event.is_set():
+        try:
+            def on_open(ws):
+                nonlocal reconnect_delay
+                reconnect_delay = PUMP_WS_RECONNECT_DELAY
+                print("[TRADING-WS] Connected to pump.fun")
+                with _trading_engine_lock:
+                    if _trading_engine_state:
+                        _trading_engine_state["ws_connected"] = True
+
+                # Subscribe to all new token creations
+                ws.send(json.dumps({"method": "subscribeNewToken"}))
+                _trading_add_event("WS_CONNECTED", None,
+                    "WebSocket connected to pump.fun, subscribed to new tokens")
+
+                # Re-subscribe to any open position mints
+                with _trading_engine_lock:
+                    if _trading_engine_state:
+                        for mint, pos in _trading_engine_state.get("positions", {}).items():
+                            if pos.get("status") == "open":
+                                ws.send(json.dumps({
+                                    "method": "subscribeTokenTrade", "keys": [mint]
+                                }))
+
+            def on_message(ws, message):
+                if _trading_stop_event.is_set():
+                    ws.close()
+                    return
+                try:
+                    data = json.loads(message)
+                    with _trading_engine_lock:
+                        if _trading_engine_state:
+                            _trading_engine_state["ws_last_message_time"] = time.time()
+
+                    tx_type = data.get("txType")
+                    if tx_type == "create":
+                        _trading_handle_new_token(ws, data)
+                    elif tx_type in ("buy", "sell"):
+                        _trading_handle_trade(data)
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    print(f"[TRADING-WS] Message error: {str(e)[:200]}")
+
+            def on_error(ws, error):
+                print(f"[TRADING-WS] Error: {str(error)[:200]}")
+                with _trading_engine_lock:
+                    if _trading_engine_state:
+                        _trading_engine_state["ws_connected"] = False
+
+            def on_close(ws, close_status_code, close_msg):
+                print(f"[TRADING-WS] Disconnected: {close_status_code} {close_msg}")
+                with _trading_engine_lock:
+                    if _trading_engine_state:
+                        _trading_engine_state["ws_connected"] = False
+
+            ws_app = websocket.WebSocketApp(
+                PUMP_WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            _trading_ws_app_ref = ws_app   # store ref so _stop_trading_threads can force-close
+            ws_app.run_forever(
+                ping_interval=PUMP_WS_PING_INTERVAL,
+                ping_timeout=PUMP_WS_PING_TIMEOUT,
+            )
+            _trading_ws_app_ref = None
+
+        except Exception as e:
+            print(f"[TRADING-WS] Fatal: {str(e)[:200]}")
+
+        # Reconnect with exponential backoff
+        if not _trading_stop_event.is_set():
+            _trading_add_event("WS_RECONNECTING", None,
+                f"Reconnecting in {reconnect_delay}s")
+            _trading_stop_event.wait(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, PUMP_WS_MAX_RECONNECT_DELAY)
+
+
+# ---- Entry Logic ----
+
+def _trading_evaluate_entries(entry_cfg, tp_multiplier, trailing_pct,
+                              budget_remaining, open_positions):
+    """Evaluate tracked tokens for entry using DUAL-GATE system (v7.0):
+    Gate 1 (pump_score): Basic sanity — enough trades, wallets, volume, buy ratio.
+    Gate 2 (alpha_score): Predictive quality — smart money, acceleration, birth quality.
+
+    The pump_score minimum is RELAXED (lowered by 20%) because it is no longer the
+    primary signal. Instead, alpha_score is the ranking signal and must exceed
+    PNA_ENTRY_ALPHA_MIN. This means we can enter tokens EARLIER (before they have
+    enough velocity/volume to score high on pump_score) if the alpha signals are
+    strong (smart money present, accelerating, organic birth).
+
+    High-confidence fast-track: If alpha_score >= PNA_ENTRY_FAST_TRACK_ALPHA,
+    relax the min_trades and min_wallets requirements by 50%, allowing even earlier
+    entry on extremely high-conviction signals."""
+    candidates = []
+
+    with _trading_token_states_lock:
+        for mint, ts in _trading_token_states.items():
+            if mint in open_positions or ts.get("position_taken"):
+                continue
+
+            alpha_score = ts.get("alpha_score", 0)
+            pump_score = ts["pump_score"]
+
+            # Gate 2 (PNA): Alpha score must meet minimum
+            if alpha_score < PNA_ENTRY_ALPHA_MIN:
+                continue
+
+            # Fast-track: high alpha relaxes traditional gate requirements
+            is_fast_track = alpha_score >= PNA_ENTRY_FAST_TRACK_ALPHA
+            relax_factor = 0.5 if is_fast_track else 1.0
+
+            # Gate 1 (legacy): Relaxed pump_score minimum (80% of original threshold)
+            relaxed_pump_min = entry_cfg["min_pump_score"] * 0.8
+            if pump_score < relaxed_pump_min:
+                continue
+
+            # Minimum trade/wallet checks (relaxed on fast-track)
+            min_trades = max(3, int(entry_cfg["min_trades"] * relax_factor))
+            min_wallets = max(3, int(entry_cfg["min_wallets"] * relax_factor))
+
+            if ts["window_trades_count"] < min_trades:
+                continue
+            if len(ts["window_unique_wallets"]) < min_wallets:
+                continue
+
+            total_vol_sol = (ts["window_buy_volume_lamports"]
+                             + ts["window_sell_volume_lamports"])  # already SOL
+            min_vol = entry_cfg["min_vol_sol"] * relax_factor
+            if total_vol_sol < min_vol:
+                continue
+
+            # Buy ratio check (slightly relaxed for pullback entries)
+            min_buy_ratio = entry_cfg["min_buy_ratio"]
+            if ts.get("alpha_components", {}).get("pullback", 0) > 50:
+                min_buy_ratio = max(0.50, min_buy_ratio - 0.10)  # pullback = more sellers is OK
+            if ts["window_buy_ratio"] < min_buy_ratio:
+                continue
+
+            # Token age check: skip if older than 15 min
+            if (time.time() - ts["first_seen"]) > 900:
+                continue
+            # Market cap filter: skip very early tokens (low liquidity = high slippage)
+            if ts.get("market_cap_sol", 0) < 30.0:
+                continue
+
+            # v7.2 INVENTION 1: OBSERVATION WINDOW — don't buy until we've watched for 60s
+            # Most creators dump in first 30-60s. Every other bot rushes to buy first.
+            # We deliberately wait, sacrificing the initial spike to avoid the rug.
+            token_age = time.time() - ts["first_seen"]
+            if token_age < OBSERVER_MIN_AGE_SECONDS:
+                continue
+
+            # v7.2 INVENTION 1b: Creator clearance — creator must not have sold for 45s
+            # If the creator EVER sold during the observation window, skip permanently
+            if ts.get("creator_selling"):
+                continue
+
+            # v7.2 INVENTION 3: Creator blacklist — check if creator dumped previous tokens
+            if _pna_is_creator_blacklisted(mint):
+                continue
+
+            # HARD VETO: Never enter decelerating tokens
+            if ts.get("acceleration_phase") == "decelerating":
+                continue
+
+            candidates.append({
+                "mint": mint,
+                "pump_score": pump_score,
+                "alpha_score": alpha_score,
+                "alpha_components": dict(ts.get("alpha_components", {})),
+                "components": dict(ts["score_components"]),
+                "virtual_sol_reserves": ts["latest_virtual_sol_reserves"],
+                "trades": ts["window_trades_count"],
+                "wallets": len(ts["window_unique_wallets"]),
+                "buy_ratio": round(ts["window_buy_ratio"], 3),
+                "is_fast_track": is_fast_track,
+                "smart_wallets": len(ts.get("smart_wallets_in", set())),
+                "acceleration_phase": ts.get("acceleration_phase", "unknown"),
+            })
+
+    # PNA v7.0: Sort by ALPHA score (predictive), not pump_score (lagging)
+    candidates.sort(key=lambda c: c["alpha_score"], reverse=True)
+
+    for cand in candidates:
+        # Check budget + slots
+        with _trading_engine_lock:
+            if not _trading_engine_state or not _trading_engine_state.get("active"):
+                break
+            current_open = sum(1 for p in _trading_engine_state.get("positions", {}).values()
+                               if p.get("status") == "open")
+            if current_open >= PUMP_MAX_POSITIONS:
+                break
+            remaining = _trading_engine_state["config"]["max_sol_budget"] - \
+                _trading_engine_state.get("sol_spent", 0.0) + \
+                _trading_engine_state.get("sol_received", 0.0)
+            if remaining < 0.01:
+                break
+            wallet_key = _trading_engine_state.get("wallet_private_key", "")
+            jupiter_key = _trading_engine_state.get("jupiter_api_key", "")
+
+        # PNA v7.0: Position size based on ALPHA score (stronger signals = bigger bets)
+        base_pct = entry_cfg["position_size_pct"]
+        alpha_score = cand["alpha_score"]
+        if alpha_score >= 80:
+            size_mult = 2.0   # very high conviction — 2x base bet
+        elif alpha_score >= 70:
+            size_mult = 1.5   # high conviction
+        elif alpha_score >= 60:
+            size_mult = 1.0   # standard
+        else:
+            size_mult = 0.5   # marginal — small bet
+        # Extra boost for fast-track entries with smart money
+        if cand.get("is_fast_track") and cand.get("smart_wallets", 0) >= 3:
+            size_mult = min(size_mult * 1.3, 2.5)
+        position_sol = remaining * base_pct * size_mult
+        position_sol = min(position_sol, remaining * 0.25)  # cap at 25% of remaining budget
+        position_sol = min(position_sol, 0.25)  # v7.3: hard cap 0.25 SOL per trade (0.50 was too large — avg loss -0.05 on 15 trades at 0.50)
+        position_lamports = int(position_sol * 1_000_000_000)
+        if position_lamports < 20_000_000:  # min 0.02 SOL (smaller wastes gas fees)
+            break
+
+        mint = cand["mint"]
+        _trading_add_event("BUY_SIGNAL", mint,
+            f"ALPHA {cand['alpha_score']:.1f} / pump {cand['pump_score']:.1f} "
+            f"{'[FAST-TRACK]' if cand.get('is_fast_track') else ''} "
+            f"phase={cand.get('acceleration_phase','?')} "
+            f"smart={cand.get('smart_wallets', 0)} — "
+            f"buying {position_sol:.4f} SOL "
+            f"(trades={cand['trades']} wallets={cand['wallets']} ratio={cand['buy_ratio']})",
+            cand)
+
+        with _trading_engine_lock:
+            if _trading_engine_state:
+                _trading_engine_state["stats"]["buys_attempted"] = \
+                    _trading_engine_state["stats"].get("buys_attempted", 0) + 1
+
+        # v6.3: Try bonding curve first (faster, works pre-graduation), Jupiter fallback
+        buy_result = _pump_curve_buy(mint, position_sol, wallet_key)
+        if not buy_result.get("success"):
+            print(f"[TRADING] Pump curve buy failed ({buy_result.get('error','')[:60]}), trying Jupiter...")
+            buy_result = _auto_buy_token(mint, position_lamports, wallet_key, jupiter_key,
+                                         slippage_bps=PUMP_BUY_SLIPPAGE_BPS,
+                                         priority=PUMP_BUY_PRIORITY)
+
+        if buy_result.get("success"):
+            tokens_received = buy_result.get("tokens_received", 0)
+            sol_per_token = position_sol / tokens_received if tokens_received > 0 else 0
+            tp_target_sol = position_sol * tp_multiplier
+
+            position_entry = {
+                "mint": mint,
+                "buy_time": datetime.now(timezone.utc).isoformat(),
+                "buy_sol_amount": position_sol,
+                "buy_token_amount": tokens_received,
+                "buy_signature": buy_result.get("signature"),
+                "buy_price_sol_per_token": sol_per_token,
+                "entry_virtual_sol_reserves": cand["virtual_sol_reserves"],
+                "current_value_sol": position_sol,
+                "peak_value_sol": position_sol,
+                "trailing_stop_price_sol": position_sol * (1 - _trading_compute_trailing_pct(1.0) / 100.0),
+                "tp_target_sol": tp_target_sol,
+                "status": "open",
+                "sell_result": None,
+                "sell_time": None,
+                "exit_reason": None,
+                "pump_score_at_entry": cand["pump_score"],
+                "alpha_score_at_entry": cand["alpha_score"],
+                "alpha_components_at_entry": cand.get("alpha_components", {}),
+                "buy_time_epoch": time.time(),
+            }
+
+            with _trading_engine_lock:
+                if _trading_engine_state:
+                    _trading_engine_state["positions"][mint] = position_entry
+                    _trading_engine_state["sol_spent"] = \
+                        _trading_engine_state.get("sol_spent", 0) + position_sol
+                    _trading_engine_state["stats"]["buys_succeeded"] = \
+                        _trading_engine_state["stats"].get("buys_succeeded", 0) + 1
+
+            # Mark token + managed mints
+            with _trading_token_states_lock:
+                if mint in _trading_token_states:
+                    _trading_token_states[mint]["position_taken"] = True
+            with _trading_managed_mints_lock:
+                _trading_managed_mints.add(mint)
+
+            _trading_add_event("BUY_EXECUTED", mint,
+                f"Bought {tokens_received} tokens for {position_sol:.4f} SOL "
+                f"(alpha={cand['alpha_score']:.1f}), "
+                f"TP target: {tp_target_sol:.4f} SOL ({tp_multiplier}x)",
+                buy_result)
+        else:
+            with _trading_engine_lock:
+                if _trading_engine_state:
+                    _trading_engine_state["stats"]["buys_failed"] = \
+                        _trading_engine_state["stats"].get("buys_failed", 0) + 1
+            # Mark token to prevent retry — don't waste cycles on untradable tokens
+            with _trading_token_states_lock:
+                if mint in _trading_token_states:
+                    _trading_token_states[mint]["position_taken"] = True
+            _trading_add_event("BUY_FAILED", mint,
+                f"Buy failed: {buy_result.get('error', 'unknown')}", buy_result)
+
+        time.sleep(0.3)  # v6.3: faster rate limit (was 1.0s)
+
+
+# ---- Exit Logic ----
+
+def _trading_execute_sell(mint, exit_reason):
+    """Execute sell for a position. Uses EMERGENCY priority with Jito."""
+    with _trading_engine_lock:
+        if not _trading_engine_state:
+            return
+        pos = _trading_engine_state.get("positions", {}).get(mint)
+        if not pos or pos.get("status") != "open":
+            return
+        pos["status"] = "selling"
+        wallet_key = _trading_engine_state.get("wallet_private_key", "")
+        jupiter_key = _trading_engine_state.get("jupiter_api_key", "")
+        _trading_engine_state["stats"]["sells_attempted"] = \
+            _trading_engine_state["stats"].get("sells_attempted", 0) + 1
+
+    event_id = f"trading_sell_{mint[:16]}_{int(time.time())}"
+
+    # v6.3: Try bonding curve sell first (faster, works pre-graduation), Jupiter fallback
+    token_amount = pos.get("buy_token_amount", 0) if pos else 0
+    sell_result = _pump_curve_sell(mint, token_amount, wallet_key)
+    if not sell_result.get("success"):
+        print(f"[TRADING] Pump curve sell failed ({sell_result.get('error','')[:60]}), trying Jupiter...")
+        sell_result = _auto_sell_position(
+            mint, wallet_key, jupiter_key,
+            slippage_bps=PUMP_SELL_SLIPPAGE_BPS,
+            priority=PUMP_SELL_PRIORITY,
+            event_id=event_id)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    success = sell_result.get("success", False)
+
+    with _trading_engine_lock:
+        if _trading_engine_state and mint in _trading_engine_state.get("positions", {}):
+            p = _trading_engine_state["positions"][mint]
+            p["sell_result"] = sell_result
+            p["sell_time"] = now_iso
+            p["exit_reason"] = exit_reason
+
+            if success:
+                p["status"] = "sold"
+                # v6.3: For pump curve sells, estimate SOL from reserves; Jupiter gives out_amount
+                if sell_result.get("method") == "pump_curve":
+                    sol_received = p.get("current_value_sol", p["buy_sol_amount"])
+                else:
+                    sol_received = int(sell_result.get("out_amount", "0")) / 1e9
+                _trading_engine_state["sol_received"] = \
+                    _trading_engine_state.get("sol_received", 0) + sol_received
+                pnl = sol_received - p["buy_sol_amount"]
+                _trading_engine_state["stats"]["total_pnl_sol"] = \
+                    _trading_engine_state["stats"].get("total_pnl_sol", 0) + pnl
+                _trading_engine_state["stats"]["sells_succeeded"] = \
+                    _trading_engine_state["stats"].get("sells_succeeded", 0) + 1
+            else:
+                p["status"] = "failed"
+                _trading_engine_state["stats"]["sells_failed"] = \
+                    _trading_engine_state["stats"].get("sells_failed", 0) + 1
+
+    # Remove from managed mints so portfolio can pick up if needed
+    with _trading_managed_mints_lock:
+        _trading_managed_mints.discard(mint)
+
+    # v7.2 INVENTION 3: Blacklist creator if this was a creator dump exit
+    if success and exit_reason == "pna_creator_dump":
+        try:
+            with _pna_creator_wallets_lock:
+                creator = _pna_creator_wallets.get(mint)
+            if creator:
+                _pna_blacklist_creator(creator, mint)
+        except Exception:
+            pass
+
+    _trading_add_event(
+        "SELL_EXECUTED" if success else "SELL_FAILED", mint,
+        f"Sell {'SUCCESS' if success else 'FAILED'} ({exit_reason}): "
+        f"{sell_result.get('signature', sell_result.get('error', 'unknown'))}",
+        sell_result)
+
+
+def _trading_compute_trailing_pct(profit_ratio):
+    """Dynamic trailing stop v7.1: MUCH tighter to prevent runaway losses.
+    v7.0 had 35% initial trailing = avg loss -0.13 SOL per trigger.
+    v7.1: 20% initial, tightening faster. Key insight from data:
+    - trailing_stop was #1 loss source (-1.17 SOL across 9 trades, 1W/8L)
+    - Most tokens that trigger trailing stop never recover
+    - Better to exit at -20% than ride to -50%"""
+    if profit_ratio >= 3.0:
+        return 8    # ultra-tight at 3x+ (protect massive wins)
+    elif profit_ratio >= 2.0:
+        return 10   # very tight at 2x-3x
+    elif profit_ratio >= 1.5:
+        return 12   # tight at 1.5x-2x
+    elif profit_ratio >= 1.3:
+        return 15   # moderate at 1.3x-1.5x (lock in profits)
+    elif profit_ratio >= 1.1:
+        return 18   # break-even lock zone
+    else:
+        return 20   # v7.1: was 35%, now 20% (cut max loss from -35% to -20%)
+
+
+def _trading_evaluate_exits(open_positions, tp_multiplier, trailing_pct):
+    """Check all open positions for exit conditions."""
+    for mint, pos in open_positions.items():
+        if _trading_stop_event.is_set():
+            break
+
+        exit_reason = None
+
+        # Get live token state
+        with _trading_token_states_lock:
+            ts = _trading_token_states.get(mint, {})
+            buy_ratio = ts.get("window_buy_ratio", 0.5)
+            trades_count = ts.get("window_trades_count", 0)
+            current_reserves = ts.get("latest_virtual_sol_reserves", 0)
+            token_age = time.time() - ts.get("first_seen", time.time()) if ts else 0
+
+        entry_reserves = pos.get("entry_virtual_sol_reserves", 0)
+
+        # Estimate current value via reserves ratio (free, real-time, no RPC)
+        if entry_reserves > 0 and current_reserves > 0:
+            reserve_ratio = current_reserves / entry_reserves
+            estimated_value = pos["buy_sol_amount"] * reserve_ratio
+        else:
+            estimated_value = pos.get("current_value_sol", pos["buy_sol_amount"])
+
+        # Update current + peak
+        with _trading_engine_lock:
+            if _trading_engine_state and mint in _trading_engine_state.get("positions", {}):
+                p = _trading_engine_state["positions"][mint]
+                p["current_value_sol"] = estimated_value
+                if estimated_value > p.get("peak_value_sol", 0):
+                    p["peak_value_sol"] = estimated_value
+                    profit_ratio = estimated_value / p.get("buy_sol_amount", estimated_value) if p.get("buy_sol_amount") else 1.0
+                    dynamic_trailing_pct = _trading_compute_trailing_pct(profit_ratio)
+                    p["trailing_stop_price_sol"] = estimated_value * (1 - dynamic_trailing_pct / 100.0)
+                # v7.1: Time-based trailing tightening — if position is 90s+ old and below 1.15x,
+                # tighten stop aggressively. Most pump.fun winners show 1.2x+ within 60s.
+                # If we're flat after 90s, cut losses fast.
+                hold_age = time.time() - p.get("buy_time_epoch", 0) if p.get("buy_time_epoch") else 0
+                if hold_age > 90:
+                    current_ratio = estimated_value / p.get("buy_sol_amount", 1) if p.get("buy_sol_amount") else 1.0
+                    if current_ratio < 1.15:
+                        # Force trailing stop to 12% from current peak (aggressive exit for stagnant positions)
+                        tight_stop = p.get("peak_value_sol", estimated_value) * (1 - 0.12)
+                        if tight_stop > p.get("trailing_stop_price_sol", 0):
+                            p["trailing_stop_price_sol"] = tight_stop
+                peak = p.get("peak_value_sol", pos["buy_sol_amount"])
+                trailing_stop = p.get("trailing_stop_price_sol", 0)
+                tp_target = p.get("tp_target_sol", pos["buy_sol_amount"] * tp_multiplier)
+
+        # CHECK 1: ADAPTIVE Take-profit (v7.2 INVENTION 2)
+        # Instead of fixed 2x TP (which barely ever hits), use a 2-stage system:
+        # Stage 1: At 1.25x, check if token is still accelerating
+        #   - If accelerating → escalate TP to 2x (ride the wave)
+        #   - If stable/decelerating → TAKE PROFIT NOW at 1.25x (don't give it back)
+        # This captures the frequent 1.2-1.5x peaks that v7.0/v7.1 held through and lost.
+        profit_ratio_now = estimated_value / pos["buy_sol_amount"] if pos["buy_sol_amount"] > 0 else 1.0
+        adaptive_tp_sol = pos["buy_sol_amount"] * ADAPTIVE_TP_INITIAL
+        if estimated_value >= tp_target:
+            # Full TP hit (2x) — always take it
+            exit_reason = f"tp_{tp_multiplier:.0f}x"
+            _trading_add_event("TP_HIT", mint,
+                f"FULL Take-profit: {estimated_value:.4f} >= {tp_target:.4f} SOL ({tp_multiplier}x)")
+        elif profit_ratio_now >= ADAPTIVE_TP_INITIAL:
+            # At 1.25x+ — check acceleration phase
+            with _trading_token_states_lock:
+                accel_phase = _trading_token_states.get(mint, {}).get("acceleration_phase", "unknown")
+            if accel_phase == "accelerating" and ADAPTIVE_TP_ESCALATE_CONDITION_ACCEL:
+                # Still accelerating — hold for full 2x, but tighten trailing stop to lock profit
+                with _trading_engine_lock:
+                    if _trading_engine_state and mint in _trading_engine_state.get("positions", {}):
+                        p2 = _trading_engine_state["positions"][mint]
+                        # Lock in at least 1.10x of entry (tight trailing from here)
+                        lock_price = pos["buy_sol_amount"] * 1.10
+                        if lock_price > p2.get("trailing_stop_price_sol", 0):
+                            p2["trailing_stop_price_sol"] = lock_price
+                _trading_add_event("ADAPTIVE_TP_ESCALATE", mint,
+                    f"At {profit_ratio_now:.2f}x, still accelerating — holding for {tp_multiplier}x "
+                    f"(locked trailing at 1.10x entry)")
+            else:
+                # Not accelerating — TAKE PROFIT NOW at 1.25x+
+                exit_reason = f"adaptive_tp_{profit_ratio_now:.1f}x"
+                _trading_add_event("ADAPTIVE_TP_HIT", mint,
+                    f"Adaptive TP: {estimated_value:.4f} SOL ({profit_ratio_now:.2f}x) — "
+                    f"phase={accel_phase}, taking profit instead of waiting for {tp_multiplier}x")
+
+        # CHECK 2: Trailing stop (only if we're above entry)
+        elif estimated_value <= trailing_stop and peak > pos["buy_sol_amount"] * 1.05:
+            exit_reason = "trailing_stop"
+            _trading_add_event("TRAILING_STOP", mint,
+                f"Trailing stop: {estimated_value:.4f} SOL "
+                f"(peak={peak:.4f}, stop={trailing_stop:.4f})")
+
+        # CHECK 3: Fail-safe — buy ratio collapse (only after 30s hold to avoid instant exits)
+        elif buy_ratio < PUMP_FAILSAFE_BUY_RATIO_FLOOR and trades_count >= 5:
+            hold_time = time.time() - pos.get("buy_time_epoch", 0) if pos.get("buy_time_epoch") else 999
+            if hold_time >= 30:
+                exit_reason = "failsafe_buy_ratio"
+                _trading_add_event("FAILSAFE_RATIO", mint,
+                    f"Buy ratio collapsed: {buy_ratio:.2f} < {PUMP_FAILSAFE_BUY_RATIO_FLOOR} "
+                    f"(held {hold_time:.0f}s)")
+
+        # CHECK 4: Fail-safe — liquidity drop
+        elif entry_reserves > 0 and current_reserves > 0:
+            drop_pct = ((entry_reserves - current_reserves) / entry_reserves) * 100
+            if drop_pct >= PUMP_FAILSAFE_LIQUIDITY_DROP_PCT:
+                exit_reason = "failsafe_liquidity"
+                _trading_add_event("FAILSAFE_LIQUIDITY", mint,
+                    f"Reserves dropped {drop_pct:.1f}%")
+
+        # CHECK 5: Fail-safe — velocity collapse (only after 2 min)
+        elif trades_count < PUMP_FAILSAFE_VELOCITY_COLLAPSE and token_age > 120:
+            exit_reason = "failsafe_velocity"
+            _trading_add_event("FAILSAFE_VELOCITY", mint,
+                f"Only {trades_count} trades in 60s (min: {PUMP_FAILSAFE_VELOCITY_COLLAPSE})")
+
+        # CHECK 5.5: Stale position exit (flat after 3 minutes)
+        elif exit_reason is None:
+            buy_time = pos.get("buy_time_epoch", 0)
+            age_seconds = time.time() - buy_time if buy_time else 0
+            if age_seconds > 180:  # 3 minutes old
+                profit_ratio = estimated_value / pos["buy_sol_amount"] if pos["buy_sol_amount"] > 0 else 1.0
+                if 0.90 <= profit_ratio <= 1.10:
+                    exit_reason = "stale_position"
+                    _trading_add_event("STALE_EXIT", mint,
+                        f"Stale position exit after {age_seconds:.0f}s — "
+                        f"flat at {profit_ratio:.2f}x (val={estimated_value:.4f} SOL)")
+
+        # CHECK 6: Advisory rug alert from surveillance
+        if not exit_reason:
+            with _watched_mints_lock:
+                if mint in _watched_mints:
+                    sev = _watched_mints[mint].get("severity", "NONE")
+                    sev_val = SEVERITY_ORDER.get(sev, 0)
+                    if sev_val >= SEVERITY_ORDER.get("HIGH", 3):
+                        # Only emergency exit if we're also losing money
+                        if estimated_value < pos["buy_sol_amount"] * 0.9:
+                            exit_reason = "advisory_rug_alert"
+                            _trading_add_event("ADVISORY_RUG_EXIT", mint,
+                                f"Surveillance alert {sev} + value down — exiting")
+
+        # CHECK 7 (PNA v7.0): Creator started dumping after we entered
+        if not exit_reason:
+            with _trading_token_states_lock:
+                ts_check = _trading_token_states.get(mint, {})
+                creator_selling = ts_check.get("creator_selling", False)
+            if creator_selling:
+                hold_time = time.time() - pos.get("buy_time_epoch", 0) if pos.get("buy_time_epoch") else 999
+                if hold_time >= 15:  # give 15s to avoid race with entry
+                    exit_reason = "pna_creator_dump"
+                    _trading_add_event("PNA_CREATOR_DUMP", mint,
+                        f"Creator wallet dumping detected — emergency exit "
+                        f"(val={estimated_value:.4f} SOL)")
+
+        # CHECK 8 (PNA v7.0): Momentum phase shifted to decelerating after entry
+        if not exit_reason:
+            with _trading_token_states_lock:
+                ts_check = _trading_token_states.get(mint, {})
+                accel_phase = ts_check.get("acceleration_phase", "unknown")
+            if accel_phase == "decelerating":
+                hold_time = time.time() - pos.get("buy_time_epoch", 0) if pos.get("buy_time_epoch") else 999
+                # v7.3: faster decel exit — 20s instead of 45s, threshold 1.08x instead of 1.15x
+                if hold_time >= 20 and estimated_value < pos["buy_sol_amount"] * 1.08:
+                    exit_reason = "pna_deceleration"
+                    _trading_add_event("PNA_DECEL_EXIT", mint,
+                        f"Momentum decelerating + not profitable — exit "
+                        f"(val={estimated_value:.4f} SOL, "
+                        f"ratio={estimated_value/pos['buy_sol_amount']:.2f}x)")
+
+        if exit_reason:
+            _trading_execute_sell(mint, exit_reason)
+
+
+# ---- Signal Evaluation Loop ----
+
+def _trading_eval_loop():
+    """Daemon thread: evaluate tracked tokens every PUMP_EVAL_INTERVAL seconds.
+    v7.0: Added PNA alpha score computation and wallet DNA maintenance."""
+    _pna_decay_counter = 0  # decay wallet scores every 10th cycle (~20s)
+
+    while not _trading_stop_event.is_set():
+        try:
+            with _trading_engine_lock:
+                if not _trading_engine_state or not _trading_engine_state.get("active"):
+                    break
+                config = dict(_trading_engine_state.get("config", {}))
+                sol_spent = _trading_engine_state.get("sol_spent", 0.0)
+                positions = {m: dict(p) for m, p in
+                             _trading_engine_state.get("positions", {}).items()}
+
+            entry_mode = config.get("entry_mode", "balanced")
+            tp_mode = config.get("tp_mode", "10x")
+            trailing_pct = config.get("trailing_stop_pct", PUMP_TRAILING_STOP_DEFAULT_PCT)
+            entry_cfg = PUMP_ENTRY_MODES.get(entry_mode, PUMP_ENTRY_MODES["balanced"])
+            tp_multiplier = PUMP_TP_MODES.get(tp_mode, 10.0)
+            max_budget = config.get("max_sol_budget", PUMP_MAX_SOL_BUDGET_DEFAULT)
+            sol_received = _trading_engine_state.get("sol_received", 0)
+            budget_remaining = max_budget - sol_spent + sol_received
+
+            open_positions = {m: p for m, p in positions.items() if p.get("status") == "open"}
+
+            # STEP 1: Recompute metrics + scores for all tracked tokens
+            with _trading_token_states_lock:
+                all_mints = list(_trading_token_states.keys())
+
+            for mint in all_mints:
+                if _trading_stop_event.is_set():
+                    break
+                with _trading_token_states_lock:
+                    ts = _trading_token_states.get(mint)
+                    if not ts:
+                        continue
+                    _trading_compute_window_metrics(ts)
+                    _trading_compute_pump_score(ts)
+                    # PNA v7.0: Compute alpha score
+                    try:
+                        _pna_compute_alpha_score(ts)
+                    except Exception as pna_err:
+                        print(f"[PNA] Alpha score error {mint[:12]}: {str(pna_err)[:100]}")
+
+            with _trading_engine_lock:
+                if _trading_engine_state:
+                    _trading_engine_state["stats"]["tokens_evaluated"] = len(all_mints)
+                    _trading_engine_state["eval_last_run_time"] = time.time()
+                    # PNA stats
+                    with _pna_wallet_dna_lock:
+                        _trading_engine_state["stats"]["pna_wallets_tracked"] = len(_pna_wallet_dna)
+                        _trading_engine_state["stats"]["pna_smart_wallets"] = sum(
+                            1 for d in _pna_wallet_dna.values()
+                            if d["score"] >= PNA_SMART_MONEY_THRESHOLD)
+
+            # PNA v7.0: Periodic wallet DNA decay (every ~20s)
+            _pna_decay_counter += 1
+            if _pna_decay_counter >= 10:
+                _pna_decay_counter = 0
+                try:
+                    _pna_decay_wallet_scores()
+                except Exception:
+                    pass
+
+            # STEP 2: Entry evaluation (PNA-aware)
+            if len(open_positions) < PUMP_MAX_POSITIONS and budget_remaining > 0.01:
+                _trading_evaluate_entries(entry_cfg, tp_multiplier, trailing_pct,
+                                         budget_remaining, open_positions)
+
+            # STEP 3: Exit evaluation
+            _trading_evaluate_exits(open_positions, tp_multiplier, trailing_pct)
+
+            # STEP 4: Cleanup stale tokens
+            with _trading_token_states_lock:
+                _trading_cleanup_stale_tokens()
+
+        except Exception as e:
+            print(f"[TRADING-EVAL] Loop error: {str(e)[:300]}")
+
+        _trading_stop_event.wait(PUMP_EVAL_INTERVAL)
+
+
+# ---- Thread Lifecycle ----
+
+def _start_trading_threads():
+    """Start WebSocket consumer + signal evaluation daemon threads."""
+    global _trading_ws_thread_ref, _trading_eval_thread_ref
+
+    if _trading_ws_thread_ref and _trading_ws_thread_ref.is_alive():
+        return
+
+    _trading_stop_event.clear()
+
+    _trading_ws_thread_ref = threading.Thread(
+        target=_trading_ws_thread, daemon=True, name="trading-ws")
+    _trading_ws_thread_ref.start()
+
+    _trading_eval_thread_ref = threading.Thread(
+        target=_trading_eval_loop, daemon=True, name="trading-eval")
+    _trading_eval_thread_ref.start()
+
+
+def _stop_trading_threads():
+    """Stop the trading engine threads. Clears managed mints."""
+    global _trading_ws_thread_ref, _trading_eval_thread_ref, _trading_ws_app_ref
+    _trading_stop_event.set()
+
+    # Force-close the WebSocket connection so run_forever() exits immediately
+    if _trading_ws_app_ref:
+        try:
+            _trading_ws_app_ref.close()
+        except Exception:
+            pass
+
+    if _trading_ws_thread_ref:
+        _trading_ws_thread_ref.join(timeout=5)
+        _trading_ws_thread_ref = None
+
+    if _trading_eval_thread_ref:
+        _trading_eval_thread_ref.join(timeout=3)
+        _trading_eval_thread_ref = None
+
+    _trading_ws_app_ref = None
+
+    # Clear managed mints so portfolio auto-pilot picks them up
+    with _trading_managed_mints_lock:
+        _trading_managed_mints.clear()
+
+    # Clear token states to free memory
+    with _trading_token_states_lock:
+        _trading_token_states.clear()
+
+    # PNA v7.0: Clear PNA state (wallet DNA persists intentionally — it accumulates
+    # across sessions. Only token outcomes and creator registry are cleared.)
+    with _pna_token_outcomes_lock:
+        _pna_token_outcomes.clear()
+    with _pna_creator_wallets_lock:
+        _pna_creator_wallets.clear()
+    # NOTE: _pna_wallet_dna is NOT cleared on stop — this is deliberate.
+    # Wallet reputations accumulate across engine restarts, making the system
+    # stronger over time. The TTL-based eviction handles cleanup.
 
 
 # ---------------------------------------------------------------------------
@@ -2422,7 +4861,7 @@ def analyze(mint, dev_wallet=None, recent_signatures=None, options=None):
         "decision": decision,
         "triggered_signals": triggered_signals,
         "timestamp": timestamp,
-        "version": "5.0.0",
+        "version": "6.0.0",
     }
 
     _cache_set(_snapshot_cache, mint, {
@@ -2456,18 +4895,32 @@ def health():
         portfolio_scans = _portfolio_state.get("scan_count", 0)
         portfolio_holdings = len(_portfolio_state.get("holdings", {}))
 
+    # v6.0: Trading engine status
+    with _trading_engine_lock:
+        trading_active = (
+            _trading_ws_thread_ref is not None and _trading_ws_thread_ref.is_alive()
+        )
+        trading_ws_connected = _trading_engine_state.get("ws_connected", False) if _trading_engine_state else False
+        trading_positions = len(_trading_engine_state.get("positions", {})) if _trading_engine_state else 0
+        trading_open = sum(1 for p in _trading_engine_state.get("positions", {}).values()
+                          if p.get("status") == "open") if _trading_engine_state else 0
+    with _trading_token_states_lock:
+        trading_tokens = len(_trading_token_states)
+
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "5.0.0",
+        "version": "6.0.0",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
                       "dev_holdings", "tx_pattern_analysis",
                       "holder_concentration", "token_age", "dev_dump_penalty",
                       "strict_thresholds", "whale_surveillance", "dev_dump_monitor",
                       "fanout_detection", "exchange_exit_detection",
                       "jupiter_auto_sell", "lp_lock_analysis", "manual_sell",
-                      "portfolio_autopilot", "auto_watch", "wallet_monitoring"],
+                      "portfolio_autopilot", "auto_watch", "wallet_monitoring",
+                      "dust_filter", "stop_loss", "pump_trading_engine"],
         "auto_sell_available": SOLDERS_AVAILABLE,
+        "websocket_available": WEBSOCKET_AVAILABLE,
         "surveillance": {
             "active": _monitor_thread is not None and _monitor_thread.is_alive(),
             "watched_mints": watched_count,
@@ -2480,6 +4933,13 @@ def health():
             "wallet": (portfolio_wallet[:12] + "...") if portfolio_wallet else None,
             "scan_count": portfolio_scans,
             "holdings_count": portfolio_holdings,
+        },
+        "trading_engine": {
+            "active": trading_active,
+            "ws_connected": trading_ws_connected,
+            "positions_total": trading_positions,
+            "positions_open": trading_open,
+            "tokens_tracked": trading_tokens,
         },
         "rpc_endpoint": SOLANA_RPC_URL[:50] + "...",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2922,10 +5382,27 @@ def portfolio_start_endpoint():
       X-Wallet-Address: public key of wallet to monitor
       X-Wallet-Private-Key: private key for auto-sell
       X-Jupiter-Api-Key: Jupiter API key
+
+    Body (optional JSON):
+      stop_loss_pct: 0, 5, 10, or 20. Default 0 (disabled).
+                     Auto-sells when token value drops by this percentage.
     """
     wallet_address = request.headers.get("X-Wallet-Address", "").strip()
     wallet_private_key = request.headers.get("X-Wallet-Private-Key", "").strip()
     jupiter_api_key = request.headers.get("X-Jupiter-Api-Key", "").strip()
+
+    # v5.2: Parse optional JSON body for stop_loss_pct
+    body = request.get_json(silent=True) or {}
+    stop_loss_pct = body.get("stop_loss_pct", STOP_LOSS_DEFAULT_PCT)
+    try:
+        stop_loss_pct = int(stop_loss_pct)
+    except (TypeError, ValueError):
+        stop_loss_pct = STOP_LOSS_DEFAULT_PCT
+    if stop_loss_pct != 0 and stop_loss_pct not in STOP_LOSS_ALLOWED_PCTS:
+        return jsonify({
+            "error": f"stop_loss_pct must be one of: 0 (disabled), {sorted(STOP_LOSS_ALLOWED_PCTS)}",
+            "received": stop_loss_pct,
+        }), 400
 
     if not wallet_address or len(wallet_address) < 32:
         return jsonify({"error": "X-Wallet-Address header required (Solana public key)"}), 400
@@ -2936,13 +5413,19 @@ def portfolio_start_endpoint():
     if not SOLDERS_AVAILABLE:
         return jsonify({"error": "Portfolio Auto-Pilot requires solders library for auto-sell"}), 500
 
-    # Idempotent: if already running for this wallet, return current state
+    # Idempotent: if already running for this wallet, update config and return state
     with _portfolio_state_lock:
         if _portfolio_state and _portfolio_state.get("active"):
             if _portfolio_state.get("wallet_address") == wallet_address:
                 # Update keys in case they changed
                 _portfolio_state["wallet_private_key"] = wallet_private_key
                 _portfolio_state["jupiter_api_key"] = jupiter_api_key
+                # v5.2: Allow updating stop_loss_pct on already-running portfolio
+                old_sl = _portfolio_state.get("stop_loss_pct", 0)
+                _portfolio_state["stop_loss_pct"] = stop_loss_pct
+                if old_sl != stop_loss_pct:
+                    _portfolio_add_event("STOP_LOSS_UPDATED", None,
+                        f"Stop-loss updated: {old_sl}% → {stop_loss_pct}%")
                 state_copy = copy.deepcopy(_portfolio_state)
                 # Sanitize: remove private keys from response
                 state_copy.pop("wallet_private_key", None)
@@ -2951,6 +5434,8 @@ def portfolio_start_endpoint():
                 state_copy["events"] = list(state_copy.get("events", []))[-20:]
                 return jsonify({
                     "status": "already_running",
+                    "stop_loss_pct": stop_loss_pct,
+                    "stop_loss_enabled": stop_loss_pct > 0,
                     "portfolio": {
                         "wallet_address": state_copy.get("wallet_address"),
                         "started_at": state_copy.get("started_at"),
@@ -2990,10 +5475,13 @@ def portfolio_start_endpoint():
             "scan_errors": 0,
             "holdings": {},
             "events": deque(maxlen=PORTFOLIO_EVENTS_MAXLEN),
+            "stop_loss_pct": stop_loss_pct,
+            "_stop_loss_scan_counter": 0,
         })
 
+    sl_msg = f" | stop-loss: {stop_loss_pct}%" if stop_loss_pct > 0 else ""
     _portfolio_add_event("PORTFOLIO_STARTED", None,
-        f"Portfolio Auto-Pilot started for wallet {wallet_address[:12]}...")
+        f"Portfolio Auto-Pilot started for wallet {wallet_address[:12]}...{sl_msg}")
 
     _start_portfolio_thread()
 
@@ -3005,6 +5493,9 @@ def portfolio_start_endpoint():
         "ignore_mints": list(PORTFOLIO_IGNORE_MINTS),
         "auto_sell_enabled": True,
         "auto_sell_priority": "EMERGENCY",
+        "stop_loss_pct": stop_loss_pct,
+        "stop_loss_enabled": stop_loss_pct > 0,
+        "dust_filter_enabled": True,
         "message": "Portfolio Auto-Pilot active. First scan in progress.",
     }), 201
 
@@ -3057,6 +5548,17 @@ def portfolio_endpoint():
                 enriched.setdefault("flags", {})
                 enriched.setdefault("alerts_count", 0)
                 enriched.setdefault("recent_alerts", [])
+
+            # v5.2: PnL data for stop-loss tracked holdings
+            entry_val = enriched.get("entry_sol_value")
+            current_val = enriched.get("current_sol_value")
+            if entry_val is not None and entry_val > 0 and current_val is not None:
+                enriched["pnl_sol"] = round(current_val - entry_val, 9)
+                enriched["pnl_pct"] = round(((current_val - entry_val) / entry_val) * 100, 2)
+            else:
+                enriched["pnl_sol"] = None
+                enriched["pnl_pct"] = None
+
             enriched_holdings[mint] = enriched
 
     # Summary stats
@@ -3071,6 +5573,14 @@ def portfolio_endpoint():
         1 for h in enriched_holdings.values()
         if SEVERITY_ORDER.get(h.get("severity", "NONE"), 0) >= SEVERITY_ORDER.get("HIGH", 3)
     )
+    # v5.2: Dust + stop-loss stats
+    dust_skipped = sum(
+        1 for h in enriched_holdings.values() if h.get("watch_status") == "dust"
+    )
+    stop_loss_sold = sum(
+        1 for h in enriched_holdings.values() if h.get("stop_loss_triggered")
+    )
+    stop_loss_pct = state_copy.get("stop_loss_pct", 0)
 
     return jsonify({
         "status": "active",
@@ -3087,10 +5597,14 @@ def portfolio_endpoint():
             "actively_watching": watching_count,
             "auto_sold": sold_count,
             "high_severity_alerts": high_severity,
+            "dust_skipped": dust_skipped,
+            "stop_loss_pct": stop_loss_pct,
+            "stop_loss_enabled": stop_loss_pct > 0,
+            "stop_loss_sold": stop_loss_sold,
         },
         "holdings": enriched_holdings,
         "recent_events": events_list[-30:],
-        "version": "5.0.0",
+        "version": "6.0.0",
     })
 
 
@@ -3127,14 +5641,300 @@ def portfolio_stop_endpoint():
     })
 
 
+# ---------------------------------------------------------------------------
+# Pump.fun Trading Engine Routes (v6.0)
+# ---------------------------------------------------------------------------
+@app.route("/trading/start", methods=["POST"])
+def trading_start_endpoint():
+    """
+    Start the pump.fun real-time trading engine.
+    Headers: X-Wallet-Address, X-Wallet-Private-Key, X-Jupiter-Api-Key
+    Body JSON: entry_mode, tp_mode, trailing_stop_pct, max_sol_budget
+    """
+    if not WEBSOCKET_AVAILABLE:
+        return jsonify({"error": "websocket-client not installed — trading engine unavailable"}), 500
+    if not SOLDERS_AVAILABLE:
+        return jsonify({"error": "solders not installed — trading requires signing"}), 500
+
+    wallet_address = request.headers.get("X-Wallet-Address", "").strip()
+    wallet_private_key = request.headers.get("X-Wallet-Private-Key", "").strip()
+    jupiter_api_key = request.headers.get("X-Jupiter-Api-Key", "").strip()
+
+    # Fallback to portfolio state if headers missing
+    if not wallet_private_key or not jupiter_api_key:
+        with _portfolio_state_lock:
+            if _portfolio_state and _portfolio_state.get("active"):
+                if not wallet_address:
+                    wallet_address = _portfolio_state.get("wallet_address", "")
+                if not wallet_private_key:
+                    wallet_private_key = _portfolio_state.get("wallet_private_key", "")
+                if not jupiter_api_key:
+                    jupiter_api_key = _portfolio_state.get("jupiter_api_key", "")
+
+    if not wallet_address or len(wallet_address) < 32:
+        return jsonify({"error": "X-Wallet-Address header required"}), 400
+    if not wallet_private_key:
+        return jsonify({"error": "X-Wallet-Private-Key header required"}), 400
+
+    body = request.get_json(silent=True) or {}
+
+    entry_mode = body.get("entry_mode", "balanced")
+    if entry_mode not in PUMP_ENTRY_MODES:
+        return jsonify({"error": f"entry_mode must be: {list(PUMP_ENTRY_MODES.keys())}"}), 400
+
+    tp_mode = body.get("tp_mode", "10x")
+    if tp_mode not in PUMP_TP_MODES:
+        return jsonify({"error": f"tp_mode must be: {list(PUMP_TP_MODES.keys())}"}), 400
+
+    trailing_stop_pct = body.get("trailing_stop_pct", PUMP_TRAILING_STOP_DEFAULT_PCT)
+    try:
+        trailing_stop_pct = int(trailing_stop_pct)
+        if not (1 <= trailing_stop_pct <= 50):
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "trailing_stop_pct must be integer 1-50"}), 400
+
+    max_sol_budget = body.get("max_sol_budget", PUMP_MAX_SOL_BUDGET_DEFAULT)
+    try:
+        max_sol_budget = float(max_sol_budget)
+        if max_sol_budget <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "max_sol_budget must be positive number"}), 400
+
+    # Idempotent: if already running, update config
+    with _trading_engine_lock:
+        if _trading_engine_state and _trading_engine_state.get("active"):
+            _trading_engine_state["config"]["entry_mode"] = entry_mode
+            _trading_engine_state["config"]["tp_mode"] = tp_mode
+            _trading_engine_state["config"]["trailing_stop_pct"] = trailing_stop_pct
+            _trading_engine_state["config"]["max_sol_budget"] = max_sol_budget
+            _trading_engine_state["wallet_private_key"] = wallet_private_key
+            _trading_engine_state["jupiter_api_key"] = jupiter_api_key
+            _trading_add_event("CONFIG_UPDATED", None,
+                f"Config: {entry_mode}/{tp_mode}/{trailing_stop_pct}%TS/{max_sol_budget}SOL")
+            return jsonify({
+                "status": "already_running",
+                "config_updated": True,
+                "config": _trading_engine_state["config"],
+            }), 200
+
+    _stop_trading_threads()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with _trading_engine_lock:
+        _trading_engine_state.clear()
+        _trading_engine_state.update({
+            "active": True,
+            "started_at": now_iso,
+            "config": {
+                "entry_mode": entry_mode,
+                "tp_mode": tp_mode,
+                "trailing_stop_pct": trailing_stop_pct,
+                "max_sol_budget": max_sol_budget,
+            },
+            "wallet_address": wallet_address,
+            "wallet_private_key": wallet_private_key,
+            "jupiter_api_key": jupiter_api_key,
+            "sol_spent": 0.0,
+            "sol_received": 0.0,
+            "positions": {},
+            "events": deque(maxlen=PUMP_EVENTS_MAXLEN),
+            "stats": {
+                "tokens_seen": 0, "tokens_evaluated": 0,
+                "buys_attempted": 0, "buys_succeeded": 0, "buys_failed": 0,
+                "sells_attempted": 0, "sells_succeeded": 0, "sells_failed": 0,
+                "total_pnl_sol": 0.0,
+            },
+            "ws_connected": False,
+            "ws_last_message_time": 0.0,
+            "eval_last_run_time": 0.0,
+        })
+
+    _trading_add_event("ENGINE_STARTED", None,
+        f"Trading engine: {entry_mode}/{tp_mode}/{trailing_stop_pct}%TS budget={max_sol_budget}SOL")
+    _start_trading_threads()
+
+    return jsonify({
+        "status": "started",
+        "started_at": now_iso,
+        "config": {
+            "entry_mode": entry_mode,
+            "tp_mode": tp_mode,
+            "trailing_stop_pct": trailing_stop_pct,
+            "max_sol_budget": max_sol_budget,
+            "max_positions": PUMP_MAX_POSITIONS,
+        },
+        "wallet_address": wallet_address,
+        "entry_thresholds": PUMP_ENTRY_MODES[entry_mode],
+        "tp_multiplier": PUMP_TP_MODES[tp_mode],
+    }), 201
+
+
+@app.route("/trading", methods=["GET"])
+def trading_status_endpoint():
+    """Get current trading engine state: positions, PnL, top signals."""
+    with _trading_engine_lock:
+        if not _trading_engine_state or not _trading_engine_state.get("active"):
+            return jsonify({
+                "status": "inactive",
+                "message": "Trading engine not running. Call POST /trading/start.",
+            }), 404
+        state_copy = copy.deepcopy(_trading_engine_state)
+
+    state_copy.pop("wallet_private_key", None)
+    state_copy.pop("jupiter_api_key", None)
+    events_list = list(state_copy.get("events", []))[-50:]
+
+    # Top scoring tokens (v7.0: includes alpha_score and PNA components)
+    active_tokens = []
+    with _trading_token_states_lock:
+        for mint, ts in _trading_token_states.items():
+            if ts["pump_score"] > 0 or ts.get("alpha_score", 0) > 0:
+                active_tokens.append({
+                    "mint": mint,
+                    "pump_score": ts["pump_score"],
+                    "alpha_score": ts.get("alpha_score", 0),
+                    "alpha_components": ts.get("alpha_components", {}),
+                    "acceleration_phase": ts.get("acceleration_phase", "unknown"),
+                    "smart_wallets": len(ts.get("smart_wallets_in", set())),
+                    "creator_selling": ts.get("creator_selling", False),
+                    "components": ts.get("score_components", {}),
+                    "trades_60s": ts["window_trades_count"],
+                    "buy_ratio": round(ts["window_buy_ratio"], 3),
+                    "unique_wallets": len(ts["window_unique_wallets"]),
+                    "volume_sol": round(
+                        (ts["window_buy_volume_lamports"]
+                         + ts["window_sell_volume_lamports"]), 4),  # already SOL
+                    "age_seconds": round(time.time() - ts["first_seen"], 1),
+                })
+    # v7.0: Sort by alpha_score (primary), pump_score (tiebreaker)
+    active_tokens.sort(key=lambda t: (t["alpha_score"], t["pump_score"]), reverse=True)
+
+    return jsonify({
+        "status": "active",
+        "started_at": state_copy.get("started_at"),
+        "config": state_copy.get("config"),
+        "wallet_address": state_copy.get("wallet_address"),
+        "ws_connected": state_copy.get("ws_connected"),
+        "budget": {
+            "max_sol": state_copy["config"]["max_sol_budget"],
+            "sol_spent": round(state_copy.get("sol_spent", 0), 6),
+            "sol_received": round(state_copy.get("sol_received", 0), 6),
+            "net_pnl_sol": round(state_copy["stats"].get("total_pnl_sol", 0), 6),
+            "remaining": round(
+                state_copy["config"]["max_sol_budget"]
+                - state_copy.get("sol_spent", 0)
+                + state_copy.get("sol_received", 0), 6),
+        },
+        "positions": state_copy.get("positions", {}),
+        "positions_open": sum(
+            1 for p in state_copy.get("positions", {}).values()
+            if p.get("status") == "open"),
+        "positions_closed": sum(
+            1 for p in state_copy.get("positions", {}).values()
+            if p.get("status") in ("sold", "failed")),
+        "stats": state_copy.get("stats", {}),
+        "top_scoring_tokens": active_tokens[:20],
+        "tokens_tracked": len(active_tokens),
+        "events": events_list,
+        "version": "7.3.0-observer",
+    })
+
+
+@app.route("/trading/stop", methods=["POST"])
+def trading_stop_endpoint():
+    """Stop the trading engine. Open positions remain until manually closed."""
+    with _trading_engine_lock:
+        if not _trading_engine_state or not _trading_engine_state.get("active"):
+            return jsonify({"error": "Trading engine not running"}), 404
+        state_copy = copy.deepcopy(_trading_engine_state)
+        _trading_engine_state["active"] = False
+
+    _stop_trading_threads()
+
+    state_copy.pop("wallet_private_key", None)
+    state_copy.pop("jupiter_api_key", None)
+    events_list = list(state_copy.get("events", []))[-20:]
+
+    _trading_add_event("ENGINE_STOPPED", None, "Trading engine stopped by user")
+
+    open_pos = [m for m, p in state_copy.get("positions", {}).items()
+                if p.get("status") == "open"]
+
+    return jsonify({
+        "status": "stopped",
+        "ran_since": state_copy.get("started_at"),
+        "stats": state_copy.get("stats", {}),
+        "budget_summary": {
+            "sol_spent": round(state_copy.get("sol_spent", 0), 6),
+            "sol_received": round(state_copy.get("sol_received", 0), 6),
+            "net_pnl_sol": round(state_copy["stats"].get("total_pnl_sol", 0), 6),
+        },
+        "open_positions_remaining": open_pos,
+        "warning": f"{len(open_pos)} positions still open — use /sell to close"
+            if open_pos else None,
+        "final_events": events_list,
+    })
+
+
+@app.route("/trading/config", methods=["POST"])
+def trading_config_endpoint():
+    """Update trading engine config on-the-fly."""
+    with _trading_engine_lock:
+        if not _trading_engine_state or not _trading_engine_state.get("active"):
+            return jsonify({"error": "Trading engine not running"}), 404
+
+    body = request.get_json(silent=True) or {}
+    updates = {}
+
+    if "entry_mode" in body:
+        if body["entry_mode"] not in PUMP_ENTRY_MODES:
+            return jsonify({"error": f"Invalid entry_mode: {list(PUMP_ENTRY_MODES.keys())}"}), 400
+        updates["entry_mode"] = body["entry_mode"]
+    if "tp_mode" in body:
+        if body["tp_mode"] not in PUMP_TP_MODES:
+            return jsonify({"error": f"Invalid tp_mode: {list(PUMP_TP_MODES.keys())}"}), 400
+        updates["tp_mode"] = body["tp_mode"]
+    if "trailing_stop_pct" in body:
+        try:
+            val = int(body["trailing_stop_pct"])
+            if not (1 <= val <= 50):
+                raise ValueError
+            updates["trailing_stop_pct"] = val
+        except (TypeError, ValueError):
+            return jsonify({"error": "trailing_stop_pct must be 1-50"}), 400
+    if "max_sol_budget" in body:
+        try:
+            val = float(body["max_sol_budget"])
+            if val <= 0:
+                raise ValueError
+            updates["max_sol_budget"] = val
+        except (TypeError, ValueError):
+            return jsonify({"error": "max_sol_budget must be positive"}), 400
+
+    if not updates:
+        return jsonify({"error": "No valid fields",
+                        "valid_fields": ["entry_mode", "tp_mode", "trailing_stop_pct", "max_sol_budget"]}), 400
+
+    with _trading_engine_lock:
+        for k, v in updates.items():
+            _trading_engine_state["config"][k] = v
+        current_config = dict(_trading_engine_state.get("config", {}))
+
+    _trading_add_event("CONFIG_UPDATED", None, f"Config updated: {updates}")
+
+    return jsonify({"status": "updated", "changes": updates, "current_config": current_config})
+
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
         "service": "Rapid Rug Filter",
-        "description": "Solana meme coin rug risk scanner with portfolio auto-pilot + auto-sell guardian + LP analysis",
-        "version": "5.0.0",
+        "description": "Solana meme coin rug risk scanner + portfolio auto-pilot + pump.fun trading engine",
+        "version": "6.0.0",
         "endpoints": {
-            "GET /health": "Health check with surveillance + portfolio status",
+            "GET /health": "Health check with surveillance + portfolio + trading engine status",
             "POST /analyze": "Analyze token mint for rug risk (includes LP check)",
             "GET /snapshot?mint=...": "Get cached analysis snapshot",
             "POST /watch": "Start surveillance with optional auto-sell protection",
@@ -3143,9 +5943,13 @@ def root():
             "POST /unwatch": "Stop watching a mint after exit",
             "POST /sell": "Manual emergency sell via Jupiter (token → SOL)",
             "POST /lp": "Check liquidity pool lock status for a token",
-            "POST /portfolio/start": "Start Portfolio Auto-Pilot: continuous wallet monitoring + auto-watch",
-            "GET /portfolio": "Get live portfolio: all holdings, watch status, severity, events",
+            "POST /portfolio/start": "Start Portfolio Auto-Pilot with optional stop-loss",
+            "GET /portfolio": "Get live portfolio: holdings, PnL, dust status, stop-loss status",
             "POST /portfolio/stop": "Stop portfolio monitoring (surveillance continues)",
+            "POST /trading/start": "Start pump.fun real-time trading engine",
+            "GET /trading": "Get trading engine state: positions, PnL, top signals",
+            "POST /trading/stop": "Stop trading engine (open positions remain)",
+            "POST /trading/config": "Update trading config on-the-fly",
         },
         "analyze_body": {
             "mint": "(required) Solana token mint address",
@@ -3165,6 +5969,9 @@ def root():
             "slippage_bps": "(optional) Override slippage, default 1200 emergency / 500 normal",
             "event_id": "(optional) Idempotency key — prevents duplicate sells",
         },
+        "portfolio_start_body": {
+            "stop_loss_pct": "(optional) Auto-sell when token drops by this %. Values: 0 (disabled), 5, 10, 20. Default: 0",
+        },
         "lp_body": {
             "mint": "(required) Token mint address to check LP for",
         },
@@ -3175,6 +5982,21 @@ def root():
             "X-Wallet-Address": "Solana wallet public key — for /portfolio/start (wallet to monitor)",
             "X-Wallet-Private-Key": "Solana wallet private key (base58) — for /sell, /watch, /portfolio auto_sell",
             "X-Jupiter-Api-Key": "Jupiter API key — for /sell, /watch, /portfolio, and /lp",
+        },
+        "trading_start_body": {
+            "entry_mode": "conservative | balanced | aggressive (default: balanced)",
+            "tp_mode": "2x | 3x | 5x | 10x | 15x (default: 10x)",
+            "trailing_stop_pct": "1-50, trailing stop % (default: 30)",
+            "max_sol_budget": "total SOL to allocate (default: 1.0)",
+        },
+        "v6_features": {
+            "pump_trading_engine": "Real-time pump.fun WebSocket scanner + auto-buy/sell",
+            "entry_modes": "Conservative/balanced/aggressive with pump_score thresholds",
+            "take_profit": "Configurable 2x/3x/5x/10x/15x TP with tiered trailing stop",
+            "fail_safes": "Auto-exit on buy ratio flip, liquidity drop, velocity collapse",
+            "coexistence": "Trading engine and portfolio auto-pilot run simultaneously without interference",
+            "dust_filter": "Skips worthless dust tokens (< 0.001 SOL value)",
+            "stop_loss": "Auto-sells on configured % drop (5/10/20%)",
         },
     })
 

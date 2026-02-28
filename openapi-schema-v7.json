@@ -1,0 +1,345 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Rapid Rug Filter Trading API",
+    "version": "7.3.0",
+    "description": "Solana pump.fun autonomous trading engine with PNA (Predator Network Alpha) algorithm. Scans pump.fun for new tokens, evaluates using 6-subsystem alpha scoring, auto-buys high-conviction signals, and auto-sells with adaptive take-profit and trailing stops. Also includes token analysis, surveillance, and portfolio monitoring."
+  },
+  "servers": [
+    {
+      "url": "https://serverless.on-demand.io/apps/rapid-rug-filter"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Health check and system status",
+        "description": "Returns service health, version, active features, trading engine status.",
+        "responses": {
+          "200": {
+            "description": "Service health status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Health check response with version, features, trading engine status"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trading": {
+      "get": {
+        "operationId": "getTradingStatus",
+        "summary": "Get full trading engine status with PnL, positions, and signals",
+        "description": "Returns comprehensive trading state: budget (spent/received/remaining), net PnL, all open and closed positions with entry/exit details, top scoring tokens with alpha components, DNA database stats (smart wallets tracked), WebSocket connection status, and recent events. This is the PRIMARY endpoint for monitoring trading performance.",
+        "parameters": [
+          {
+            "name": "X-Wallet-Address",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet public address",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "X-Wallet-Private-Key",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet private key (base58)",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Trading engine status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Full trading state: status, ws_connected, budget{max_sol,sol_spent,sol_received,remaining,net_pnl_sol}, positions{mint:{status,buy_sol_amount,current_value_sol,peak_value_sol,exit_reason}}, stats{buys_succeeded,sells_succeeded,total_pnl_sol,pna_smart_wallets,pna_wallets_tracked}, top_scoring_tokens[{mint,alpha_score,pump_score,alpha_components}], events[], version"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trading/start": {
+      "post": {
+        "operationId": "startTrading",
+        "summary": "Start the autonomous trading engine",
+        "description": "Start the pump.fun trading engine. Connects to pump.fun WebSocket, scans new tokens, auto-buys based on PNA alpha scoring, and auto-sells with adaptive TP and trailing stops. Configure entry aggressiveness, take-profit target, budget, and trailing stop percentage.",
+        "parameters": [
+          {
+            "name": "X-Wallet-Address",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet public address",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "X-Wallet-Private-Key",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet private key (base58)",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "X-Jupiter-Api-Key",
+            "in": "header",
+            "required": true,
+            "description": "Jupiter aggregator API key",
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "entry_mode": {
+                    "type": "string",
+                    "enum": ["conservative", "balanced", "aggressive"],
+                    "default": "aggressive",
+                    "description": "Entry aggressiveness. Conservative=tight filters, Aggressive=wider net with alpha-gated quality"
+                  },
+                  "tp_mode": {
+                    "type": "string",
+                    "enum": ["2x", "3x", "5x", "10x", "15x"],
+                    "default": "2x",
+                    "description": "Take-profit target multiplier. Adaptive TP starts at 1.15x and escalates to this if still accelerating"
+                  },
+                  "max_sol_budget": {
+                    "type": "number",
+                    "default": 2.0,
+                    "description": "Maximum SOL budget for trading. Budget recycles as sells return SOL"
+                  },
+                  "trailing_stop_pct": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "Base trailing stop percentage (1-50). Actual stop is tiered based on profit ratio"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Trading engine started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Start confirmation with config, entry_thresholds, tp_multiplier, wallet_address"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trading/stop": {
+      "post": {
+        "operationId": "stopTrading",
+        "summary": "Stop the trading engine and sell all open positions",
+        "description": "Gracefully stops the trading engine. Sells all open positions, disconnects WebSocket, and returns final PnL summary with budget breakdown and all trade events.",
+        "parameters": [
+          {
+            "name": "X-Wallet-Address",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet public address",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "X-Wallet-Private-Key",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet private key (base58)",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Trading engine stopped with final results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Stop result: status, budget_summary{net_pnl_sol,sol_spent,sol_received}, stats, open_positions_remaining, final_events"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trading/config": {
+      "patch": {
+        "operationId": "updateTradingConfig",
+        "summary": "Update trading engine configuration while running",
+        "description": "Hot-update the trading engine config without stopping it. Can change entry_mode, tp_mode, trailing_stop_pct, and max_sol_budget on the fly.",
+        "parameters": [
+          {
+            "name": "X-Wallet-Address",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet public address",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "X-Wallet-Private-Key",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet private key (base58)",
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "entry_mode": {
+                    "type": "string",
+                    "enum": ["conservative", "balanced", "aggressive"],
+                    "description": "Change entry aggressiveness"
+                  },
+                  "tp_mode": {
+                    "type": "string",
+                    "enum": ["2x", "3x", "5x", "10x", "15x"],
+                    "description": "Change take-profit target"
+                  },
+                  "trailing_stop_pct": {
+                    "type": "integer",
+                    "description": "Change trailing stop percentage (1-50)"
+                  },
+                  "max_sol_budget": {
+                    "type": "number",
+                    "description": "Change maximum SOL budget"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Configuration updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Updated config values"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyze": {
+      "post": {
+        "operationId": "analyzeToken",
+        "summary": "Analyze a token for rug risk",
+        "description": "Full risk analysis: authority checks, holder concentration, dev wallet detection, LP lock status, tx patterns.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["mint"],
+                "properties": {
+                  "mint": {
+                    "type": "string",
+                    "description": "Solana token mint address to analyze"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Analysis result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Risk analysis with risk_score, risk_level, decision"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sell": {
+      "post": {
+        "operationId": "sellToken",
+        "summary": "Emergency sell tokens for SOL",
+        "description": "Sell all holdings of a token back to SOL via Jupiter or pump curve.",
+        "parameters": [
+          {
+            "name": "X-Wallet-Address",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet public address",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "X-Wallet-Private-Key",
+            "in": "header",
+            "required": true,
+            "description": "Solana wallet private key (base58)",
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["mint"],
+                "properties": {
+                  "mint": {
+                    "type": "string",
+                    "description": "Token mint address to sell"
+                  },
+                  "priority": {
+                    "type": "string",
+                    "default": "EMERGENCY",
+                    "description": "EMERGENCY (high bribe + wide slippage) or NORMAL"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sell executed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Sell result with success, signature, tokens_sold"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

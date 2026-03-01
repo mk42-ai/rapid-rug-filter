@@ -275,7 +275,7 @@ PNA_ACCEL_MAX_PENALTY = -30.0         # cap deceleration penalty
 # Creator Wallet Behavior
 PNA_CREATOR_HOLDING_BONUS = 10.0      # bonus if creator still holds (hasn't sold)
 PNA_CREATOR_SELLING_PENALTY = -25.0   # penalty if creator is selling
-PNA_CREATOR_DUMP_THRESHOLD_PCT = 20.0 # creator sold >20% of their balance = dump signal
+PNA_CREATOR_DUMP_THRESHOLD_PCT = 20.0 # creator sold >20% of their balance = dump signal (reverted from 40%)
 
 # Bonding Curve Position (graduation proximity)
 PNA_GRADUATION_MCAP_SOL = 85.0        # ~85 SOL mcap = graduation threshold
@@ -304,13 +304,13 @@ PNA_ENTRY_FAST_TRACK_ALPHA = 75.0     # high-confidence: skip some min_trades ch
 # INVENTION 1: Observation Window — don't buy ANY token until we've watched it for N seconds
 # Most creators dump in the first 30-60s. Every other bot tries to be FIRST. We wait.
 # This sacrifices the initial spike but eliminates ~60% of creator dump losses.
-OBSERVER_MIN_AGE_SECONDS = 15         # v7.3: 30s missed too many pumps. 15s still catches instant-dump creators (most dump in <10s)
+OBSERVER_MIN_AGE_SECONDS = 10         # v7.4c: lowered from 15s — enter earlier to avoid buying at peak; 10s still catches instant dumpers
 OBSERVER_CREATOR_CLEAR_SECONDS = 25   # creator must NOT have sold for 25s after first_seen
 
 # INVENTION 2: Adaptive TP — start at 1.25x, escalate to 2x if still accelerating
 # Data shows: 1 out of 65 trades hit 2x TP, but DOZENS peaked at 1.2-1.5x
 # We held through those peaks and lost. Capture the frequent wins.
-ADAPTIVE_TP_INITIAL = 1.15            # v7.3: lowered from 1.25x — data shows only 13% of trades reach 1.10x, 0% reach 1.25x after 30s obs window
+ADAPTIVE_TP_INITIAL = 1.08            # v7.4: lowered from 1.15x — data shows tokens peak at ~1.05x before creator dump; capture smaller wins
 ADAPTIVE_TP_ESCALATED = 2.0           # hold for 2x ONLY if still accelerating at 1.25x
 ADAPTIVE_TP_ESCALATE_CONDITION_ACCEL = True  # must be accelerating to escalate
 
@@ -3669,8 +3669,8 @@ def _pna_compute_alpha_score(token_state):
                 if smart_wallet_count >= 10:
                     break
     if smart_wallet_count < 10:
-        # Warmup phase: smart money contributes neutral (50) instead of 0
-        smart_money_norm = max(50.0, min(100.0, (smart_money_raw / PNA_SMART_MONEY_MAX_BOOST) * 100.0)) if PNA_SMART_MONEY_MAX_BOOST > 0 else 50.0
+        # v7.4: Reduced warmup bonus from 50 to 25 — with 900+ tracked wallets, 0 smart is a real signal
+        smart_money_norm = max(25.0, min(100.0, (smart_money_raw / PNA_SMART_MONEY_MAX_BOOST) * 100.0)) if PNA_SMART_MONEY_MAX_BOOST > 0 else 25.0
     else:
         smart_money_norm = min(100.0, (smart_money_raw / PNA_SMART_MONEY_MAX_BOOST) * 100.0) if PNA_SMART_MONEY_MAX_BOOST > 0 else 0
     # Acceleration: range is -30 to +25, map to 0-100 (50 = neutral)
@@ -3703,9 +3703,10 @@ def _pna_compute_alpha_score(token_state):
     # Clamp to 0-100
     alpha_score = max(0.0, min(100.0, alpha_score))
 
-    # Hard veto: if creator is actively dumping, cap alpha at 30 regardless
+    # v7.4: Creator selling penalty — 12% reduction instead of hard cap
+    # On pump.fun, creator selling is common; only truly strong signals should pass
     if token_state.get("creator_selling"):
-        alpha_score = min(alpha_score, 30.0)
+        alpha_score *= 0.88
 
     # Hard veto: if early life detected scam pattern, cap at 25
     if early_life_raw <= PNA_EARLY_SCAM_PENALTY * 0.8:
@@ -3973,10 +3974,8 @@ def _trading_evaluate_entries(entry_cfg, tp_multiplier, trailing_pct,
             if token_age < OBSERVER_MIN_AGE_SECONDS:
                 continue
 
-            # v7.2 INVENTION 1b: Creator clearance — creator must not have sold for 45s
-            # If the creator EVER sold during the observation window, skip permanently
-            if ts.get("creator_selling"):
-                continue
+            # v7.4: Creator selling is handled by alpha penalty (0.88x multiplier)
+            # No hard veto — let strong signals pass even with creator selling
 
             # v7.2 INVENTION 3: Creator blacklist — check if creator dumped previous tokens
             if _pna_is_creator_blacklisted(mint):
@@ -3984,6 +3983,11 @@ def _trading_evaluate_entries(entry_cfg, tp_multiplier, trailing_pct,
 
             # HARD VETO: Never enter decelerating tokens
             if ts.get("acceleration_phase") == "decelerating":
+                continue
+
+            # v7.4: Require minimum smart wallets — zero smart money = no validation
+            smart_wallet_count = len(ts.get("smart_wallets_in", set()))
+            if smart_wallet_count < 2:
                 continue
 
             candidates.append({
@@ -4037,7 +4041,7 @@ def _trading_evaluate_entries(entry_cfg, tp_multiplier, trailing_pct,
             size_mult = min(size_mult * 1.3, 2.5)
         position_sol = remaining * base_pct * size_mult
         position_sol = min(position_sol, remaining * 0.25)  # cap at 25% of remaining budget
-        position_sol = min(position_sol, 0.25)  # v7.3: hard cap 0.25 SOL per trade (0.50 was too large — avg loss -0.05 on 15 trades at 0.50)
+        position_sol = min(position_sol, 0.05)  # v7.4c: hard cap 0.05 SOL per trade — limit downside; many exits are creator dumps at -10-15%
         position_lamports = int(position_sol * 1_000_000_000)
         if position_lamports < 20_000_000:  # min 0.02 SOL (smaller wastes gas fees)
             break
@@ -4313,6 +4317,13 @@ def _trading_evaluate_exits(open_positions, tp_multiplier, trailing_pct):
                     f"Adaptive TP: {estimated_value:.4f} SOL ({profit_ratio_now:.2f}x) — "
                     f"phase={accel_phase}, taking profit instead of waiting for {tp_multiplier}x")
 
+        # CHECK 1.5 (v7.4d): Hard stop-loss at 0.70x — NEVER let a position lose more than 30%
+        elif estimated_value < pos["buy_sol_amount"] * 0.70:
+            exit_reason = "hard_stop_loss"
+            _trading_add_event("HARD_STOP_LOSS", mint,
+                f"Hard stop-loss: value {estimated_value:.4f} SOL < 70% of entry "
+                f"{pos['buy_sol_amount']:.4f} SOL — cutting loss")
+
         # CHECK 2: Trailing stop (only if we're above entry)
         elif estimated_value <= trailing_stop and peak > pos["buy_sol_amount"] * 1.05:
             exit_reason = "trailing_stop"
@@ -4375,7 +4386,7 @@ def _trading_evaluate_exits(open_positions, tp_multiplier, trailing_pct):
                 creator_selling = ts_check.get("creator_selling", False)
             if creator_selling:
                 hold_time = time.time() - pos.get("buy_time_epoch", 0) if pos.get("buy_time_epoch") else 999
-                if hold_time >= 15:  # give 15s to avoid race with entry
+                if hold_time >= 15:  # 15s hold check to avoid race with entry (reverted from 30s)
                     exit_reason = "pna_creator_dump"
                     _trading_add_event("PNA_CREATOR_DUMP", mint,
                         f"Creator wallet dumping detected — emergency exit "
@@ -4910,7 +4921,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "7.3.0-observer",
+        "version": "7.4.0-observer",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
                       "dev_holdings", "tx_pattern_analysis",
                       "holder_concentration", "token_age", "dev_dump_penalty",
@@ -5838,7 +5849,7 @@ def trading_status_endpoint():
         "top_scoring_tokens": active_tokens[:20],
         "tokens_tracked": len(active_tokens),
         "events": events_list,
-        "version": "7.3.0-observer",
+        "version": "7.4.0-observer",
     })
 
 

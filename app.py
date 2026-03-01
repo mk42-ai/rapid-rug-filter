@@ -4910,7 +4910,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "rapid-rug-filter",
-        "version": "6.0.0",
+        "version": "7.3.0-observer",
         "features": ["auto_dev_detection", "authority_check", "supply_monitor",
                       "dev_holdings", "tx_pattern_analysis",
                       "holder_concentration", "token_age", "dev_dump_penalty",
